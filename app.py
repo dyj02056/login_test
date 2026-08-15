@@ -1,48 +1,55 @@
-import sqlite3
+import hmac
+import os
 from pathlib import Path
 
-from flask import Flask, g, redirect, render_template, request, session, url_for
-from werkzeug.security import check_password_hash, generate_password_hash
+import requests
+from dotenv import load_dotenv
+from flask import Flask, redirect, render_template, request, session, url_for
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "users.db"
+load_dotenv(BASE_DIR / ".env")
+
+SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/") + "/"
+SUPABASE_KEY = os.environ["SUPABASE_KEY"]
+ADMIN_USERNAME = os.environ["ADMIN_USERNAME"]
+ADMIN_PASSWORD = os.environ["ADMIN_PASSWORD"]
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = "dev-secret-key-change-me"
 
 
-def get_db():
-    if "db" not in g:
-        g.db = sqlite3.connect(DB_PATH)
-        g.db.row_factory = sqlite3.Row
-    return g.db
-
-
-@app.teardown_appcontext
-def close_db(exception=None):
-    db = g.pop("db", None)
-    if db is not None:
-        db.close()
-
-
-def init_db():
-    db = sqlite3.connect(DB_PATH)
-    db.execute(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-        """
+def call_supabase_rpc(function_name, payload=None):
+    response = requests.post(
+        f"{SUPABASE_URL}rpc/{function_name}",
+        json=payload or {},
+        headers={
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": "application/json",
+        },
+        timeout=10,
     )
-    db.commit()
-    db.close()
+    response.raise_for_status()
+    return response.json()
+
+
+def is_signup_enabled():
+    try:
+        return bool(call_supabase_rpc("get_signup_enabled"))
+    except requests.RequestException:
+        return True
+
+
+def is_admin_login(username, password):
+    return hmac.compare_digest(username, ADMIN_USERNAME) and hmac.compare_digest(
+        password, ADMIN_PASSWORD
+    )
 
 
 @app.route("/")
 def index():
+    if session.get("is_admin"):
+        return redirect(url_for("admin_panel"))
     if session.get("user_id"):
         return redirect(url_for("dashboard"))
     return redirect(url_for("login"))
@@ -50,6 +57,11 @@ def index():
 
 @app.route("/signup", methods=["GET", "POST"])
 def signup():
+    signup_enabled = is_signup_enabled()
+
+    if not signup_enabled:
+        return render_template("signup.html", error=None, username="", disabled=True)
+
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
@@ -64,23 +76,18 @@ def signup():
             error = "비밀번호가 일치하지 않습니다."
 
         if error is None:
-            db = get_db()
-            existing = db.execute(
-                "SELECT id FROM users WHERE username = ?", (username,)
-            ).fetchone()
-            if existing is not None:
-                error = "이미 사용 중인 아이디입니다."
-            else:
-                db.execute(
-                    "INSERT INTO users (username, password_hash) VALUES (?, ?)",
-                    (username, generate_password_hash(password)),
-                )
-                db.commit()
+            result = call_supabase_rpc(
+                "signup_user", {"p_username": username, "p_password": password}
+            )
+            if result.get("success"):
                 return redirect(url_for("login", signup="success"))
+            error = result.get("error", "회원가입에 실패했습니다.")
 
-        return render_template("signup.html", error=error, username=username)
+        return render_template(
+            "signup.html", error=error, username=username, disabled=False
+        )
 
-    return render_template("signup.html", error=None, username="")
+    return render_template("signup.html", error=None, username="", disabled=False)
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -89,19 +96,24 @@ def login():
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
 
-        db = get_db()
-        user = db.execute(
-            "SELECT * FROM users WHERE username = ?", (username,)
-        ).fetchone()
+        if is_admin_login(username, password):
+            session.clear()
+            session["is_admin"] = True
+            session["username"] = username
+            return redirect(url_for("admin_panel"))
 
-        if user is None or not check_password_hash(user["password_hash"], password):
+        result = call_supabase_rpc(
+            "login_user", {"p_username": username, "p_password": password}
+        )
+
+        if not result.get("success"):
             return render_template(
                 "login.html", error="아이디 또는 비밀번호가 올바르지 않습니다.", username=username
             )
 
         session.clear()
-        session["user_id"] = user["id"]
-        session["username"] = user["username"]
+        session["user_id"] = result["id"]
+        session["username"] = result["username"]
         return redirect(url_for("dashboard"))
 
     signup_success = request.args.get("signup") == "success"
@@ -123,6 +135,24 @@ def dashboard():
     return render_template("dashboard.html", username=session.get("username"))
 
 
+@app.route("/admin")
+def admin_panel():
+    if not session.get("is_admin"):
+        return redirect(url_for("login"))
+    return render_template(
+        "admin.html", username=session.get("username"), signup_enabled=is_signup_enabled()
+    )
+
+
+@app.route("/admin/toggle-signup", methods=["POST"])
+def admin_toggle_signup():
+    if not session.get("is_admin"):
+        return redirect(url_for("login"))
+    call_supabase_rpc(
+        "set_signup_enabled", {"p_enabled": not is_signup_enabled()}
+    )
+    return redirect(url_for("admin_panel"))
+
+
 if __name__ == "__main__":
-    init_db()
     app.run(debug=True)

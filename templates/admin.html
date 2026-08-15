@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}관리자{% endblock %}
+{% block content %}
+    <h1>관리자 패널</h1>
+    <p class="notice success">{{ username }}님으로 로그인되었습니다.</p>
+
+    <p style="margin-top: 20px; font-size: 14px; color: #374151;">
+        회원가입 상태:
+        {% if signup_enabled %}
+            <strong style="color: #15803d;">켜짐 (누구나 가입 가능)</strong>
+        {% else %}
+            <strong style="color: #b91c1c;">꺼짐 (가입 중단됨)</strong>
+        {% endif %}
+    </p>
+
+    <form method="post" action="{{ url_for('admin_toggle_signup') }}">
+        <button type="submit">
+            {% if signup_enabled %}회원가입 끄기{% else %}회원가입 켜기{% endif %}
+        </button>
+    </form>
+
+    <a class="button" style="background:#6b7280; margin-top: 10px;" href="{{ url_for('logout') }}">로그아웃</a>
+{% endblock %}
