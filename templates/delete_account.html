@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}회원 탈퇴{% endblock %}
+{% block content %}
+    <h1>회원 탈퇴</h1>
+
+    <p class="notice error">탈퇴하면 계정과 모든 정보가 삭제되며 되돌릴 수 없습니다.</p>
+
+    <form method="post" action="{{ url_for('delete_account') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+        <label for="password">확인을 위해 비밀번호를 입력하세요</label>
+        <input type="password" id="password" name="password" required autofocus>
+
+        <button type="submit" class="danger">탈퇴하기</button>
+    </form>
+
+    <p class="switch"><a href="{{ url_for('dashboard') }}">취소하고 돌아가기</a></p>
+{% endblock %}

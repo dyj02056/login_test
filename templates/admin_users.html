@@ -1,0 +1,82 @@
+{% extends "base.html" %}
+{% block title %}회원 관리{% endblock %}
+{% block card_class %}wide{% endblock %}
+{% block content %}
+    <h1>회원 관리</h1>
+    <p class="subtle">전체 {{ total }}명</p>
+
+    <form method="get" action="{{ url_for('admin_users') }}" class="search-row">
+        <input type="text" name="q" value="{{ search }}" placeholder="아이디 검색">
+        <button type="submit" class="inline">검색</button>
+    </form>
+
+    {% if users %}
+        <div class="table-scroll">
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th><th>아이디</th><th>이메일</th>
+                    <th>상태</th><th>권한</th><th>가입일</th><th>작업</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for u in users %}
+                    <tr>
+                        <td class="mono">{{ u.id }}</td>
+                        <td><strong>{{ u.username }}</strong></td>
+                        <td class="subtle">{{ u.email or '-' }}</td>
+                        <td>
+                            {% if u.is_active %}
+                                <span class="badge ok">활성</span>
+                            {% else %}
+                                <span class="badge danger">정지</span>
+                            {% endif %}
+                        </td>
+                        <td>
+                            {% if u.is_admin %}
+                                <span class="badge admin">관리자</span>
+                            {% else %}
+                                <span class="subtle">일반</span>
+                            {% endif %}
+                        </td>
+                        <td class="mono subtle">{{ u.created_at[:10] }}</td>
+                        <td class="actions">
+                            <form method="post" action="{{ url_for('admin_toggle_active', user_id=u.id) }}">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                <input type="hidden" name="active" value="{{ '0' if u.is_active else '1' }}">
+                                <button type="submit" class="mini">{{ '정지' if u.is_active else '활성화' }}</button>
+                            </form>
+                            <form method="post" action="{{ url_for('admin_toggle_admin', user_id=u.id) }}">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                <input type="hidden" name="is_admin" value="{{ '0' if u.is_admin else '1' }}">
+                                <button type="submit" class="mini">{{ '권한해제' if u.is_admin else '관리자로' }}</button>
+                            </form>
+                            <form method="post" action="{{ url_for('admin_reset_link', user_id=u.id) }}">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                <input type="hidden" name="username" value="{{ u.username }}">
+                                <button type="submit" class="mini">재설정 링크</button>
+                            </form>
+                            <form method="post" action="{{ url_for('admin_delete_user', user_id=u.id) }}"
+                                  onsubmit="return confirm('{{ u.username }} 회원을 삭제할까요? 되돌릴 수 없습니다.');">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                <button type="submit" class="mini danger">삭제</button>
+                            </form>
+                        </td>
+                    </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        </div>
+
+        {% if pages > 1 %}
+            <div class="pagination">
+                {% for p in range(1, pages + 1) %}
+                    <a href="{{ url_for('admin_users', page=p, q=search) }}"
+                       class="{% if p == page %}active{% endif %}">{{ p }}</a>
+                {% endfor %}
+            </div>
+        {% endif %}
+    {% else %}
+        <p class="subtle">회원이 없습니다.</p>
+    {% endif %}
+{% endblock %}

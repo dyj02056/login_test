@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}가입 통계{% endblock %}
+{% block card_class %}wide{% endblock %}
+{% block content %}
+    <h1>가입 통계</h1>
+
+    <div class="stat-grid">
+        <div class="stat">
+            <span class="stat-value">{{ stats.total_users or 0 }}</span>
+            <span class="stat-label">전체 회원</span>
+        </div>
+        <div class="stat">
+            <span class="stat-value">{{ stats.active_users or 0 }}</span>
+            <span class="stat-label">활성 회원</span>
+        </div>
+        <div class="stat">
+            <span class="stat-value">{{ stats.admin_users or 0 }}</span>
+            <span class="stat-label">관리자</span>
+        </div>
+        <div class="stat">
+            <span class="stat-value">{{ stats.logins_24h or 0 }}</span>
+            <span class="stat-label">24시간 로그인</span>
+        </div>
+    </div>
+
+    <h2>최근 30일 가입자</h2>
+    {% if daily %}
+        <div class="chart">
+            {% for d in daily %}
+                <div class="bar-wrap" title="{{ d.day }} — {{ d.count }}명">
+                    <div class="bar" style="height: {{ (d.count / peak * 100) | round | int }}%"></div>
+                    <span class="bar-label">{{ d.day[-2:] }}</span>
+                </div>
+            {% endfor %}
+        </div>
+        <p class="subtle">막대 위에 마우스를 올리면 날짜별 가입자 수가 표시됩니다. (최대 {{ peak }}명)</p>
+    {% else %}
+        <p class="subtle">데이터가 없습니다.</p>
+    {% endif %}
+{% endblock %}

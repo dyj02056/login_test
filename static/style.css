@@ -28,11 +28,25 @@ body {
     max-width: 380px;
 }
 
+.card.wide {
+    max-width: 940px;
+}
+
 h1 {
     margin: 0 0 24px;
     font-size: 24px;
     color: #1f2937;
     text-align: center;
+}
+
+.card.wide h1 {
+    text-align: left;
+}
+
+h2 {
+    margin: 32px 0 12px;
+    font-size: 16px;
+    color: #1f2937;
 }
 
 form {
@@ -47,13 +61,47 @@ label {
     margin: 12px 0 6px;
 }
 
-input {
+label.checkbox {
+    flex-direction: row;
+    align-items: center;
+    gap: 6px;
+    display: flex;
+    font-weight: 500;
+    color: #4b5563;
+    margin-top: 16px;
+}
+
+label.checkbox input {
+    width: auto;
+    margin: 0;
+}
+
+.hint {
+    font-weight: 400;
+    color: #9ca3af;
+    font-size: 12px;
+}
+
+.hint-block {
+    font-size: 13px;
+    color: #6b7280;
+    line-height: 1.6;
+    background: #f9fafb;
+    border-radius: 8px;
+    padding: 12px 14px;
+    margin: 12px 0;
+}
+
+input[type="text"],
+input[type="password"],
+input[type="email"] {
     padding: 10px 12px;
     border: 1px solid #d1d5db;
     border-radius: 8px;
     font-size: 14px;
     outline: none;
     transition: border-color 0.15s;
+    width: 100%;
 }
 
 input:focus {
@@ -80,8 +128,55 @@ button:hover, .button:hover {
     background: #4f46e5;
 }
 
+button.danger, .button.danger {
+    background: #dc2626;
+}
+
+button.danger:hover {
+    background: #b91c1c;
+}
+
+button.inline {
+    margin-top: 0;
+    padding: 10px 16px;
+    font-size: 14px;
+    white-space: nowrap;
+    width: auto;
+}
+
+button.mini {
+    margin: 0;
+    padding: 5px 9px;
+    font-size: 12px;
+    font-weight: 500;
+    background: #eef2ff;
+    color: #4338ca;
+    width: auto;
+}
+
+button.mini:hover {
+    background: #e0e7ff;
+}
+
+button.mini.danger {
+    background: #fee2e2;
+    color: #b91c1c;
+}
+
+button.mini.danger:hover {
+    background: #fecaca;
+}
+
+.button.gray {
+    background: #6b7280;
+}
+
+.button.gray:hover {
+    background: #4b5563;
+}
+
 .switch {
-    margin-top: 20px;
+    margin-top: 16px;
     text-align: center;
     font-size: 13px;
     color: #6b7280;
@@ -101,7 +196,9 @@ button:hover, .button:hover {
     padding: 10px 12px;
     border-radius: 8px;
     font-size: 13px;
-    margin: 0 0 8px;
+    margin: 0 0 12px;
+    line-height: 1.5;
+    word-break: break-all;
 }
 
 .notice.error {
@@ -112,4 +209,241 @@ button:hover, .button:hover {
 .notice.success {
     background: #dcfce7;
     color: #15803d;
+}
+
+.nav {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    margin-bottom: 24px;
+    padding-bottom: 16px;
+    border-bottom: 1px solid #e5e7eb;
+}
+
+.nav a {
+    font-size: 13px;
+    font-weight: 600;
+    color: #4b5563;
+    text-decoration: none;
+    padding: 6px 12px;
+    border-radius: 6px;
+}
+
+.nav a:hover {
+    background: #f3f4f6;
+    color: #4338ca;
+}
+
+.menu {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 20px;
+}
+
+.menu a {
+    font-size: 14px;
+    color: #4338ca;
+    text-decoration: none;
+    padding: 10px 12px;
+    background: #f5f6ff;
+    border-radius: 8px;
+    text-align: center;
+    font-weight: 600;
+}
+
+.menu a:hover {
+    background: #eef2ff;
+}
+
+.menu a.danger-link {
+    color: #b91c1c;
+    background: #fef2f2;
+}
+
+.menu a.danger-link:hover {
+    background: #fee2e2;
+}
+
+.subtle {
+    color: #6b7280;
+    font-size: 13px;
+}
+
+.mono {
+    font-family: Consolas, Monaco, monospace;
+    font-size: 12px;
+}
+
+.ok-text { color: #15803d; }
+.danger-text { color: #b91c1c; }
+
+.stat-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 12px;
+    margin: 20px 0;
+}
+
+.stat {
+    background: #f9fafb;
+    border-radius: 10px;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.stat-value {
+    font-size: 26px;
+    font-weight: 700;
+    color: #1f2937;
+    line-height: 1.1;
+}
+
+.stat-label {
+    font-size: 12px;
+    color: #6b7280;
+}
+
+.setting-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 16px;
+    flex-wrap: wrap;
+    background: #f9fafb;
+    padding: 16px;
+    border-radius: 10px;
+    font-size: 14px;
+    color: #374151;
+}
+
+.setting-row form {
+    flex-direction: row;
+}
+
+.search-row {
+    flex-direction: row;
+    gap: 8px;
+    margin: 16px 0;
+    align-items: stretch;
+}
+
+.table-scroll {
+    overflow-x: auto;
+    margin-top: 8px;
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+}
+
+th {
+    text-align: left;
+    padding: 10px 8px;
+    border-bottom: 2px solid #e5e7eb;
+    color: #6b7280;
+    font-size: 12px;
+    font-weight: 600;
+    white-space: nowrap;
+}
+
+td {
+    padding: 10px 8px;
+    border-bottom: 1px solid #f3f4f6;
+    color: #374151;
+    vertical-align: middle;
+}
+
+td.actions {
+    display: flex;
+    gap: 4px;
+    flex-wrap: wrap;
+}
+
+td.actions form {
+    flex-direction: row;
+}
+
+.badge {
+    display: inline-block;
+    padding: 3px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 600;
+}
+
+.badge.ok { background: #dcfce7; color: #15803d; }
+.badge.danger { background: #fee2e2; color: #b91c1c; }
+.badge.admin { background: #ede9fe; color: #6d28d9; }
+
+.pagination {
+    display: flex;
+    gap: 4px;
+    justify-content: center;
+    margin-top: 20px;
+    flex-wrap: wrap;
+}
+
+.pagination a {
+    padding: 6px 11px;
+    border-radius: 6px;
+    font-size: 13px;
+    color: #4b5563;
+    text-decoration: none;
+    background: #f3f4f6;
+}
+
+.pagination a.active {
+    background: #6366f1;
+    color: #fff;
+    font-weight: 600;
+}
+
+.chart {
+    display: flex;
+    align-items: flex-end;
+    gap: 3px;
+    height: 160px;
+    padding: 12px;
+    background: #f9fafb;
+    border-radius: 10px;
+    margin-top: 8px;
+}
+
+.bar-wrap {
+    flex: 1;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+    align-items: center;
+    gap: 4px;
+    min-width: 0;
+}
+
+.bar {
+    width: 100%;
+    background: #6366f1;
+    border-radius: 3px 3px 0 0;
+    min-height: 2px;
+    transition: background 0.15s;
+}
+
+.bar-wrap:hover .bar {
+    background: #4338ca;
+}
+
+.bar-label {
+    font-size: 9px;
+    color: #9ca3af;
+}
+
+.error-code {
+    font-size: 56px;
+    color: #6366f1;
+    margin-bottom: 8px;
 }

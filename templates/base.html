@@ -8,7 +8,24 @@
 </head>
 <body>
     <div class="page">
-        <div class="card">
+        <div class="card {% block card_class %}{% endblock %}">
+            {% if current_is_admin %}
+                <nav class="nav">
+                    <a href="{{ url_for('admin_panel') }}">대시보드</a>
+                    <a href="{{ url_for('admin_users') }}">회원 관리</a>
+                    <a href="{{ url_for('admin_logs') }}">로그인 기록</a>
+                    <a href="{{ url_for('admin_stats') }}">통계</a>
+                </nav>
+            {% endif %}
+
+            {% with messages = get_flashed_messages(with_categories=true) %}
+                {% if messages %}
+                    {% for category, message in messages %}
+                        <p class="notice {{ category }}">{{ message }}</p>
+                    {% endfor %}
+                {% endif %}
+            {% endwith %}
+
             {% block content %}{% endblock %}
         </div>
     </div>

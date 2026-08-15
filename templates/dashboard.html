@@ -1,7 +1,13 @@
 {% extends "base.html" %}
 {% block title %}대시보드{% endblock %}
 {% block content %}
-    <h1>환영합니다, {{ username }}님!</h1>
+    <h1>환영합니다, {{ current_username }}님!</h1>
     <p class="notice success">로그인에 성공했습니다.</p>
+
+    <div class="menu">
+        <a href="{{ url_for('change_password') }}">비밀번호 변경</a>
+        <a href="{{ url_for('delete_account') }}" class="danger-link">회원 탈퇴</a>
+    </div>
+
     <a class="button" href="{{ url_for('logout') }}">로그아웃</a>
 {% endblock %}

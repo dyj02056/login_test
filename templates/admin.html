@@ -1,23 +1,70 @@
 {% extends "base.html" %}
 {% block title %}관리자{% endblock %}
+{% block card_class %}wide{% endblock %}
 {% block content %}
-    <h1>관리자 패널</h1>
-    <p class="notice success">{{ username }}님으로 로그인되었습니다.</p>
+    <h1>관리자 대시보드</h1>
+    <p class="subtle">{{ current_username }}님으로 로그인되었습니다.</p>
 
-    <p style="margin-top: 20px; font-size: 14px; color: #374151;">
-        회원가입 상태:
-        {% if signup_enabled %}
-            <strong style="color: #15803d;">켜짐 (누구나 가입 가능)</strong>
-        {% else %}
-            <strong style="color: #b91c1c;">꺼짐 (가입 중단됨)</strong>
-        {% endif %}
-    </p>
+    <div class="stat-grid">
+        <div class="stat">
+            <span class="stat-value">{{ stats.total_users or 0 }}</span>
+            <span class="stat-label">전체 회원</span>
+        </div>
+        <div class="stat">
+            <span class="stat-value">{{ stats.active_users or 0 }}</span>
+            <span class="stat-label">활성 회원</span>
+        </div>
+        <div class="stat">
+            <span class="stat-value">{{ stats.logins_24h or 0 }}</span>
+            <span class="stat-label">24시간 로그인</span>
+        </div>
+        <div class="stat">
+            <span class="stat-value danger-text">{{ stats.failed_24h or 0 }}</span>
+            <span class="stat-label">24시간 실패</span>
+        </div>
+    </div>
 
-    <form method="post" action="{{ url_for('admin_toggle_signup') }}">
-        <button type="submit">
-            {% if signup_enabled %}회원가입 끄기{% else %}회원가입 켜기{% endif %}
-        </button>
-    </form>
+    <h2>회원가입 설정</h2>
+    <div class="setting-row">
+        <span>
+            현재 상태:
+            {% if signup_enabled %}
+                <strong class="ok-text">켜짐 (누구나 가입 가능)</strong>
+            {% else %}
+                <strong class="danger-text">꺼짐 (가입 중단됨)</strong>
+            {% endif %}
+        </span>
+        <form method="post" action="{{ url_for('admin_toggle_signup') }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button type="submit" class="inline {% if signup_enabled %}danger{% endif %}">
+                {% if signup_enabled %}회원가입 끄기{% else %}회원가입 켜기{% endif %}
+            </button>
+        </form>
+    </div>
 
-    <a class="button" style="background:#6b7280; margin-top: 10px;" href="{{ url_for('logout') }}">로그아웃</a>
+    <h2>비밀번호 재설정 요청</h2>
+    {% if pending_resets %}
+        <table>
+            <thead>
+                <tr><th>아이디</th><th>요청 시각</th><th>만료</th></tr>
+            </thead>
+            <tbody>
+                {% for r in pending_resets %}
+                    <tr>
+                        <td>{{ r.username }}</td>
+                        <td class="mono">{{ r.created_at[:19].replace('T', ' ') }}</td>
+                        <td class="mono">{{ r.expires_at[:19].replace('T', ' ') }}</td>
+                    </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        <p class="hint-block">
+            회원 관리 화면에서 해당 회원의 <strong>재설정 링크</strong> 버튼을 눌러
+            링크를 생성한 뒤 본인에게 전달해 주세요.
+        </p>
+    {% else %}
+        <p class="subtle">대기 중인 요청이 없습니다.</p>
+    {% endif %}
+
+    <a class="button gray" href="{{ url_for('logout') }}">로그아웃</a>
 {% endblock %}
