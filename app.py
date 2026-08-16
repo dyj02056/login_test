@@ -270,9 +270,16 @@ def signup():
         if error is None:
             result = rpc(
                 "signup_user",
-                {"p_username": username, "p_password": password, "p_email": email},
+                {
+                    "p_username": username,
+                    "p_password": password,
+                    "p_email": email,
+                    "p_ip": client_ip(),
+                },
             )
             if result.get("success"):
+                if email:
+                    issue_email_verification(result["id"], email)
                 flash("회원가입이 완료되었습니다. 로그인해 주세요.", "success")
                 return redirect(url_for("login"))
             error = result.get("error", "회원가입에 실패했습니다.")
@@ -357,7 +364,15 @@ def logout():
 @app.route("/dashboard")
 @login_required
 def dashboard():
-    return render_template("dashboard.html")
+    try:
+        state = rpc("get_user_session_state", {"p_user_id": session["user_id"]})
+    except SupabaseError:
+        state = {}
+    return render_template(
+        "dashboard.html",
+        has_email=bool(state.get("has_email")),
+        email_verified=bool(state.get("email_verified")),
+    )
 
 
 # ----------------------------------------------------------------------
@@ -417,7 +432,8 @@ def delete_account():
 # 비밀번호 재설정
 # ----------------------------------------------------------------------
 
-def send_reset_email(to_email, reset_url):
+def send_email(to_email, subject, intro, link):
+    """Resend 로 메일 발송. 키가 없으면 조용히 False 를 돌려준다."""
     if not RESEND_API_KEY or not to_email:
         return False
     try:
@@ -430,12 +446,8 @@ def send_reset_email(to_email, reset_url):
             json={
                 "from": RESEND_FROM,
                 "to": [to_email],
-                "subject": "비밀번호 재설정 안내",
-                "html": (
-                    "<p>아래 링크에서 비밀번호를 재설정해 주세요. "
-                    "링크는 1시간 후 만료됩니다.</p>"
-                    f'<p><a href="{reset_url}">{reset_url}</a></p>'
-                ),
+                "subject": subject,
+                "html": f'<p>{intro}</p><p><a href="{link}">{link}</a></p>',
             },
             timeout=10,
         )
@@ -444,11 +456,47 @@ def send_reset_email(to_email, reset_url):
         return False
 
 
+def send_reset_email(to_email, reset_url):
+    return send_email(
+        to_email,
+        "비밀번호 재설정 안내",
+        "아래 링크에서 비밀번호를 재설정해 주세요. 링크는 1시간 후 만료됩니다.",
+        reset_url,
+    )
+
+
+def issue_email_verification(user_id, to_email):
+    """인증 토큰을 만들고 가능하면 메일로 보낸다. 발송 여부와 링크를 돌려준다."""
+    try:
+        result = rpc("create_email_verification", {"p_user_id": user_id})
+    except SupabaseError:
+        return False, None
+
+    if not result.get("issued"):
+        return False, None
+
+    link = url_for("verify_email", token=result["token"], _external=True)
+    sent = send_email(
+        to_email or result.get("email"),
+        "이메일 인증 안내",
+        "아래 링크를 눌러 이메일을 인증해 주세요. 링크는 24시간 후 만료됩니다.",
+        link,
+    )
+    return sent, link
+
+
 @app.route("/forgot-password", methods=["GET", "POST"])
 def forgot_password():
     if request.method == "POST":
         username = request.form.get("username", "").strip()
-        result = rpc("create_password_reset", {"p_username": username})
+        result = rpc(
+            "create_password_reset",
+            {"p_username": username, "p_ip": client_ip()},
+        )
+
+        if result.get("error"):
+            flash(result["error"], "error")
+            return render_template("forgot_password.html")
 
         if result.get("issued"):
             reset_url = url_for(
@@ -493,6 +541,29 @@ def reset_password(token):
         flash(result.get("error", "재설정에 실패했습니다."), "error")
 
     return render_template("reset_password.html", token=token)
+
+
+@app.route("/verify-email/<token>")
+def verify_email(token):
+    result = rpc("verify_email_with_token", {"p_token": token})
+    if result.get("success"):
+        flash("이메일 인증이 완료되었습니다.", "success")
+    else:
+        flash(result.get("error", "인증에 실패했습니다."), "error")
+    return redirect(url_for("index"))
+
+
+@app.route("/resend-verification", methods=["POST"])
+@login_required
+def resend_verification():
+    sent, link = issue_email_verification(session["user_id"], None)
+    if sent:
+        flash("인증 메일을 다시 보냈습니다.", "success")
+    elif link:
+        flash("인증 요청이 접수되었습니다. 관리자가 링크를 전달해 드립니다.", "success")
+    else:
+        flash("인증할 이메일이 없거나 이미 인증되었습니다.", "error")
+    return redirect(url_for("dashboard"))
 
 
 # ----------------------------------------------------------------------
@@ -614,17 +685,38 @@ def admin_force_logout(user_id):
     return safe_redirect("admin_users")
 
 
+@app.route("/admin/users/<int:user_id>/verify-link", methods=["POST"])
+@admin_required
+def admin_verify_link(user_id):
+    username = request.form.get("username", "")
+    sent, link = issue_email_verification(user_id, None)
+    if link:
+        log_admin("issue_verify_link", target_user_id=user_id, target_username=username)
+        if sent:
+            flash("인증 메일을 보냈습니다.", "success")
+        else:
+            flash(f"이메일 인증 링크(24시간 유효): {link}", "success")
+    else:
+        flash("이메일이 없거나 이미 인증된 계정입니다.", "error")
+    return safe_redirect("admin_users")
+
+
 @app.route("/admin/users/<int:user_id>/reset-link", methods=["POST"])
 @admin_required
 def admin_reset_link(user_id):
     username = request.form.get("username", "")
-    result = rpc("create_password_reset", {"p_username": username})
+    # 관리자 발급은 공개 요청과 달리 IP 제한을 걸지 않는다. 다만 같은 회원에게
+    # 반복 발급하는 것은 DB 쪽 대상별 제한(1시간 3회)이 그대로 막는다.
+    result = rpc(
+        "create_password_reset",
+        {"p_username": username, "p_ip": None},
+    )
     if result.get("issued"):
         link = url_for("reset_password", token=result["token"], _external=True)
         log_admin("issue_reset_link", target_user_id=user_id, target_username=username)
         flash(f"재설정 링크(1시간 유효): {link}", "success")
     else:
-        flash("링크 생성에 실패했습니다.", "error")
+        flash(result.get("error", "링크 생성에 실패했습니다."), "error")
     return safe_redirect("admin_users")
 
 

@@ -24,7 +24,18 @@
                     <tr>
                         <td class="mono">{{ u.id }}</td>
                         <td><strong>{{ u.username }}</strong></td>
-                        <td class="subtle">{{ u.email or '-' }}</td>
+                        <td class="subtle">
+                            {% if u.email %}
+                                {{ u.email }}
+                                {% if u.email_verified %}
+                                    <span class="badge ok">인증됨</span>
+                                {% else %}
+                                    <span class="badge danger">미인증</span>
+                                {% endif %}
+                            {% else %}
+                                -
+                            {% endif %}
+                        </td>
                         <td>
                             {% if u.is_active %}
                                 <span class="badge ok">활성</span>
@@ -63,6 +74,13 @@
                                 <input type="hidden" name="username" value="{{ u.username }}">
                                 <button type="submit" class="mini">재설정 링크</button>
                             </form>
+                            {% if u.email and not u.email_verified %}
+                                <form method="post" action="{{ url_for('admin_verify_link', user_id=u.id) }}">
+                                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                    <input type="hidden" name="username" value="{{ u.username }}">
+                                    <button type="submit" class="mini">인증 링크</button>
+                                </form>
+                            {% endif %}
                             <form method="post" action="{{ url_for('admin_delete_user', user_id=u.id) }}"
                                   data-confirm="{{ u.username }} 회원을 삭제할까요? 되돌릴 수 없습니다.">
                                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">

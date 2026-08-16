@@ -4,6 +4,18 @@
     <h1>환영합니다, {{ current_username }}님!</h1>
     <p class="notice success">로그인에 성공했습니다.</p>
 
+    {% if has_email and not email_verified %}
+        <p class="notice error">
+            이메일이 아직 인증되지 않았습니다.
+            인증하지 않아도 이용에는 문제가 없지만,
+            인증해 두면 비밀번호를 잊었을 때 메일로 재설정할 수 있습니다.
+        </p>
+        <form method="post" action="{{ url_for('resend_verification') }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button type="submit" class="inline">인증 메일 다시 받기</button>
+        </form>
+    {% endif %}
+
     <div class="menu">
         <a href="{{ url_for('change_password') }}">비밀번호 변경</a>
         <a href="{{ url_for('delete_account') }}" class="danger-link">회원 탈퇴</a>

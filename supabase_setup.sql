@@ -27,6 +27,9 @@ alter table public.users add column if not exists is_admin boolean not null defa
 -- 이전에 발급된 세션 쿠키를 즉시 무효로 만듭니다.
 alter table public.users add column if not exists session_version int not null default 1;
 
+-- 이메일 인증 여부. 현재 로그인 조건은 아니며 상태 표시용입니다.
+alter table public.users add column if not exists email_verified boolean not null default false;
+
 -- 로그인 시도 기록 (무차별 대입 차단 + 감사 로그)
 create table if not exists public.login_attempts (
     id bigint generated always as identity primary key,
@@ -57,6 +60,36 @@ create table if not exists public.password_resets (
 );
 
 create index if not exists password_resets_user_idx on public.password_resets (user_id);
+
+-- 가입·재설정 남용을 막기 위한 사건 기록.
+-- 로그인 잠금과 성격이 달라(계정이 아니라 IP 남용을 봄) 별도 테이블로 둡니다.
+create table if not exists public.rate_events (
+    id bigint generated always as identity primary key,
+    kind text not null,          -- 'signup' | 'password_reset'
+    ip text,
+    subject text,                -- 대상 아이디 (재설정에서 사용)
+    created_at timestamptz not null default now()
+);
+
+create index if not exists rate_events_kind_ip_time_idx
+    on public.rate_events (kind, ip, created_at desc);
+create index if not exists rate_events_kind_subject_time_idx
+    on public.rate_events (kind, subject, created_at desc);
+
+
+-- 이메일 인증 토큰. 비밀번호 재설정과 동일하게 원문은 저장하지 않고 해시만 보관합니다.
+create table if not exists public.email_verifications (
+    id bigint generated always as identity primary key,
+    user_id bigint not null references public.users(id) on delete cascade,
+    token_hash text not null,
+    expires_at timestamptz not null,
+    used_at timestamptz,
+    created_at timestamptz not null default now()
+);
+
+create index if not exists email_verifications_user_idx
+    on public.email_verifications (user_id);
+
 
 -- 관리자 행위 감사 로그.
 -- 대상 아이디를 함께 저장해 두므로 회원이 삭제된 뒤에도 누가 무엇을 지웠는지 남습니다.
@@ -111,6 +144,8 @@ alter table public.login_attempts enable row level security;
 alter table public.password_resets enable row level security;
 alter table public.app_settings enable row level security;
 alter table public.admin_actions enable row level security;
+alter table public.rate_events enable row level security;
+alter table public.email_verifications enable row level security;
 
 -- 오래된 기록을 언제 마지막으로 정리했는지 (자동 정리 주기 판단용)
 alter table public.app_settings add column if not exists last_pruned_at timestamptz;
@@ -173,6 +208,44 @@ $$;
 revoke all on function public.is_login_locked(text, text) from public, anon, authenticated;
 
 
+-- 가입·재설정 남용 판정. IP 를 알 수 없으면 제한하지 않습니다
+-- (IP 없이 아이디만으로 막으면 남을 방해하는 수단이 되기 때문).
+create or replace function public.is_rate_limited(
+    p_kind text,
+    p_ip text,
+    p_subject text,
+    p_ip_limit int,
+    p_subject_limit int,
+    p_minutes int
+)
+returns boolean
+language sql
+security definer
+set search_path = public
+as $$
+    select
+        (
+            coalesce(p_ip, '') <> ''
+            and (select count(*) from public.rate_events
+                  where kind = p_kind and ip = p_ip
+                    and created_at > now() - (p_minutes || ' minutes')::interval
+                ) >= p_ip_limit
+        )
+        or
+        (
+            p_subject_limit is not null
+            and coalesce(p_subject, '') <> ''
+            and (select count(*) from public.rate_events
+                  where kind = p_kind and subject = p_subject
+                    and created_at > now() - (p_minutes || ' minutes')::interval
+                ) >= p_subject_limit
+        );
+$$;
+
+revoke all on function public.is_rate_limited(text, text, text, int, int, int)
+    from public, anon, authenticated;
+
+
 -- 이전 버전의 함수 시그니처 제거 (인자가 바뀌었으므로)
 drop function if exists public.signup_user(text, text);
 drop function if exists public.login_user(text, text);
@@ -188,7 +261,8 @@ create or replace function public.signup_user(
     p_secret text,
     p_username text,
     p_password text,
-    p_email text default null
+    p_email text,
+    p_ip text
 )
 returns jsonb
 language plpgsql
@@ -206,6 +280,15 @@ begin
     select signup_enabled into v_enabled from public.app_settings where id = true;
     if not v_enabled then
         return jsonb_build_object('success', false, 'error', '현재 회원가입이 중단되었습니다.');
+    end if;
+
+    -- 한 IP 가 계정을 대량 생성하는 것을 막습니다. 성공한 가입만 세므로
+    -- 비밀번호 오타 같은 실패는 정상 사용자를 막지 않습니다.
+    if public.is_rate_limited('signup', p_ip, null, 5, null, 60) then
+        return jsonb_build_object(
+            'success', false,
+            'error', '가입 시도가 너무 많습니다. 잠시 후 다시 시도해 주세요.'
+        );
     end if;
 
     if length(p_username) < 3 then
@@ -226,8 +309,29 @@ begin
     )
     returning id into v_id;
 
+    insert into public.rate_events (kind, ip, subject)
+    values ('signup', p_ip, p_username);
+
     return jsonb_build_object('success', true, 'id', v_id);
 end;
+$$;
+
+
+-- 구버전 코드(4인자) 호환용 래퍼.
+-- 이것이 없으면 SQL 을 먼저 실행하는 순간부터 새 코드가 배포되기 전까지
+-- 운영 사이트의 회원가입이 죽습니다.
+create or replace function public.signup_user(
+    p_secret text,
+    p_username text,
+    p_password text,
+    p_email text default null
+)
+returns jsonb
+language sql
+security definer
+set search_path = public
+as $$
+    select public.signup_user(p_secret, p_username, p_password, p_email, null);
 $$;
 
 
@@ -359,7 +463,7 @@ begin
         return jsonb_build_object('found', false, 'ok', false);
     end if;
 
-    select is_active, is_admin, session_version into v
+    select is_active, is_admin, session_version, email, email_verified into v
       from public.users
      where id = p_user_id;
 
@@ -372,7 +476,9 @@ begin
         'ok', true,
         'is_active', v.is_active,
         'is_admin', v.is_admin,
-        'session_version', v.session_version
+        'session_version', v.session_version,
+        'has_email', coalesce(v.email, '') <> '',
+        'email_verified', v.email_verified
     );
 end;
 $$;
@@ -483,7 +589,8 @@ $$;
 -- 토큰 원문은 이 함수의 반환값으로 딱 한 번만 나가고, DB 에는 해시만 남습니다.
 create or replace function public.create_password_reset(
     p_secret text,
-    p_username text
+    p_username text,
+    p_ip text
 )
 returns jsonb
 language plpgsql
@@ -497,6 +604,19 @@ begin
     if not public.check_secret(p_secret) then
         return jsonb_build_object('success', false, 'error', '서버 인증에 실패했습니다.');
     end if;
+
+    -- IP 기준 5회, 아이디 기준 3회. 아이디 제한은 특정인의 메일함을
+    -- 재설정 메일로 도배하는 것을 막기 위한 것입니다.
+    if public.is_rate_limited('password_reset', p_ip, p_username, 5, 3, 60) then
+        return jsonb_build_object(
+            'success', false,
+            'error', '재설정 요청이 너무 많습니다. 잠시 후 다시 시도해 주세요.'
+        );
+    end if;
+
+    -- 존재 여부와 무관하게 기록합니다. 없는 아이디로 훑는 것도 제한 대상입니다.
+    insert into public.rate_events (kind, ip, subject)
+    values ('password_reset', p_ip, p_username);
 
     select id, username, email into v_user from public.users where username = p_username;
 
@@ -522,6 +642,20 @@ begin
         'email', v_user.email
     );
 end;
+$$;
+
+
+-- 구버전 코드(2인자) 호환용 래퍼. signup_user 와 같은 이유로 남겨 둡니다.
+create or replace function public.create_password_reset(
+    p_secret text,
+    p_username text
+)
+returns jsonb
+language sql
+security definer
+set search_path = public
+as $$
+    select public.create_password_reset(p_secret, p_username, null);
 $$;
 
 
@@ -568,6 +702,92 @@ begin
     delete from public.login_attempts
      where success = false
        and username = (select username from public.users where id = v_reset.user_id);
+
+    return jsonb_build_object('success', true);
+end;
+$$;
+
+
+-- ── 이메일 인증 ────────────────────────────────────────────
+-- 재설정과 같은 토큰 방식. 현재 로그인 조건은 아니며 상태 표시용입니다.
+-- 이메일이 선택 입력이고 메일 발송이 아직 꺼져 있어, 인증을 강제하면
+-- 기존 회원이 모두 잠기기 때문입니다.
+create or replace function public.create_email_verification(
+    p_secret text,
+    p_user_id bigint
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+    v_user record;
+    v_token text;
+begin
+    if not public.check_secret(p_secret) then
+        return jsonb_build_object('success', false);
+    end if;
+
+    select id, username, email, email_verified into v_user
+      from public.users where id = p_user_id;
+
+    if v_user.id is null or coalesce(v_user.email, '') = '' then
+        return jsonb_build_object('success', true, 'issued', false, 'reason', 'no_email');
+    end if;
+
+    if v_user.email_verified then
+        return jsonb_build_object('success', true, 'issued', false, 'reason', 'already');
+    end if;
+
+    v_token := encode(extensions.gen_random_bytes(24), 'hex');
+
+    insert into public.email_verifications (user_id, token_hash, expires_at)
+    values (
+        v_user.id,
+        encode(extensions.digest(v_token, 'sha256'), 'hex'),
+        now() + interval '24 hours'
+    );
+
+    return jsonb_build_object(
+        'success', true, 'issued', true,
+        'token', v_token,
+        'username', v_user.username,
+        'email', v_user.email
+    );
+end;
+$$;
+
+
+create or replace function public.verify_email_with_token(
+    p_secret text,
+    p_token text
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+    v_row record;
+begin
+    if not public.check_secret(p_secret) then
+        return jsonb_build_object('success', false, 'error', '서버 인증에 실패했습니다.');
+    end if;
+
+    select id, user_id into v_row
+      from public.email_verifications
+     where token_hash = encode(extensions.digest(p_token, 'sha256'), 'hex')
+       and used_at is null
+       and expires_at > now();
+
+    if v_row.id is null then
+        return jsonb_build_object('success', false,
+            'error', '링크가 만료되었거나 이미 사용되었습니다.');
+    end if;
+
+    update public.users set email_verified = true where id = v_row.user_id;
+    update public.email_verifications set used_at = now() where id = v_row.id;
 
     return jsonb_build_object('success', true);
 end;
@@ -662,7 +882,7 @@ begin
 
     select coalesce(jsonb_agg(t order by t.id desc), '[]'::jsonb) into v_rows
       from (
-        select id, username, email, is_active, is_admin, created_at
+        select id, username, email, email_verified, is_active, is_admin, created_at
           from public.users
          where p_search is null or p_search = '' or username ilike '%' || p_search || '%'
          order by id desc
@@ -892,6 +1112,13 @@ begin
      where used_at is not null or expires_at < now() - interval '7 days';
     get diagnostics v_resets = row_count;
 
+    delete from public.email_verifications
+     where used_at is not null or expires_at < now() - interval '7 days';
+
+    -- 속도 제한 판정은 최근 60분만 보므로 하루치만 남겨도 충분합니다.
+    delete from public.rate_events
+     where created_at < now() - interval '1 day';
+
     -- 감사 로그는 더 오래 (1년) 보관합니다.
     delete from public.admin_actions
      where created_at < now() - interval '365 days';
@@ -952,7 +1179,11 @@ $$;
 --    모든 함수가 p_secret 을 요구하므로 실제 실행은 서버만 가능합니다.
 -- ============================================================
 
+grant execute on function public.signup_user(text, text, text, text, text) to anon, authenticated;
 grant execute on function public.signup_user(text, text, text, text) to anon, authenticated;
+grant execute on function public.create_password_reset(text, text, text) to anon, authenticated;
+grant execute on function public.create_email_verification(text, bigint) to anon, authenticated;
+grant execute on function public.verify_email_with_token(text, text) to anon, authenticated;
 grant execute on function public.login_user(text, text, text, text) to anon, authenticated;
 grant execute on function public.check_login_lock(text, text, text) to anon, authenticated;
 grant execute on function public.record_login_attempt(text, text, text, boolean) to anon, authenticated;
