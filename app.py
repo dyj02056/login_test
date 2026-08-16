@@ -1,5 +1,6 @@
 import hmac
 import os
+import time
 from datetime import timedelta
 from functools import wraps
 from pathlib import Path
@@ -92,12 +93,57 @@ def is_signup_enabled():
 # 접근 제어 데코레이터
 # ----------------------------------------------------------------------
 
+# 세션 유효성을 다시 확인하기까지 허용하는 최대 시간(초).
+# 0 으로 두면 매 요청마다 확인하지만 모든 페이지에 DB 왕복이 붙습니다.
+SESSION_CHECK_INTERVAL = int(os.environ.get("SESSION_CHECK_INTERVAL", "60"))
+
+
+def session_is_valid():
+    """세션이 아직 살아 있는지 확인하고, 권한 변경을 세션에 반영한다.
+
+    최대 SESSION_CHECK_INTERVAL 초만큼 오래된 판정을 허용한다.
+    """
+    user_id = session.get("user_id")
+    if not user_id:
+        # 환경변수 관리자는 DB 계정이 없으므로 이 검사의 대상이 아니다.
+        return True
+
+    if time.time() - session.get("sv_checked_at", 0) < SESSION_CHECK_INTERVAL:
+        return True
+
+    try:
+        state = rpc("get_user_session_state", {"p_user_id": user_id})
+    except SupabaseError:
+        # DB 장애 때 전 사용자를 로그아웃시키는 것은 피해가 더 크다.
+        # sv_checked_at 을 갱신하지 않으므로 다음 요청에서 곧바로 다시 시도한다.
+        return True
+
+    if (
+        not state.get("found")
+        or not state.get("is_active")
+        or state.get("session_version") != session.get("sv")
+    ):
+        return False
+
+    session["is_admin"] = bool(state.get("is_admin"))
+    session["sv_checked_at"] = time.time()
+    return True
+
+
+def _reject_stale_session():
+    session.clear()
+    flash("세션이 만료되었습니다. 다시 로그인해 주세요.", "error")
+    return redirect(url_for("login"))
+
+
 def login_required(view):
     @wraps(view)
     def wrapped(*args, **kwargs):
         if not session.get("user_id"):
             flash("로그인이 필요합니다.", "error")
             return redirect(url_for("login"))
+        if not session_is_valid():
+            return _reject_stale_session()
         return view(*args, **kwargs)
 
     return wrapped
@@ -106,6 +152,10 @@ def login_required(view):
 def admin_required(view):
     @wraps(view)
     def wrapped(*args, **kwargs):
+        # 권한 판정보다 세션 갱신이 먼저여야 한다. 순서가 뒤바뀌면 방금 부여된
+        # 관리자 권한이 반영되기 전에 차단되어 재로그인해야만 들어올 수 있다.
+        if session.get("user_id") and not session_is_valid():
+            return _reject_stale_session()
         if not session.get("is_admin"):
             flash("관리자만 접근할 수 있습니다.", "error")
             return redirect(url_for("login"))
@@ -224,6 +274,8 @@ def login():
         session["user_id"] = result["id"]
         session["username"] = result["username"]
         session["is_admin"] = bool(result.get("is_admin"))
+        session["sv"] = result.get("session_version")
+        session["sv_checked_at"] = time.time()
         session.permanent = remember
 
         if session["is_admin"]:
@@ -271,7 +323,10 @@ def change_password():
             },
         )
         if result.get("success"):
-            flash("비밀번호가 변경되었습니다.", "success")
+            # 다른 기기의 세션은 끊기고, 요청을 보낸 본인만 그대로 이어간다.
+            session["sv"] = result.get("session_version")
+            session["sv_checked_at"] = time.time()
+            flash("비밀번호가 변경되었습니다. 다른 기기에서는 다시 로그인해야 합니다.", "success")
             return redirect(url_for("dashboard"))
         flash(result.get("error", "비밀번호 변경에 실패했습니다."), "error")
 
@@ -458,6 +513,14 @@ def admin_toggle_admin(user_id):
 def admin_delete_user(user_id):
     rpc("admin_delete_user", {"p_user_id": user_id})
     flash("회원을 삭제했습니다.", "success")
+    return redirect(request.referrer or url_for("admin_users"))
+
+
+@app.route("/admin/users/<int:user_id>/force-logout", methods=["POST"])
+@admin_required
+def admin_force_logout(user_id):
+    rpc("force_logout_user", {"p_user_id": user_id})
+    flash("해당 회원의 모든 세션을 종료했습니다.", "success")
     return redirect(request.referrer or url_for("admin_users"))
 
 

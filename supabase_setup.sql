@@ -23,6 +23,10 @@ alter table public.users add column if not exists email text;
 alter table public.users add column if not exists is_active boolean not null default true;
 alter table public.users add column if not exists is_admin boolean not null default false;
 
+-- 세션 무효화용 버전. 비밀번호 변경·계정 정지·권한 변경 시 1 증가시켜
+-- 이전에 발급된 세션 쿠키를 즉시 무효로 만듭니다.
+alter table public.users add column if not exists session_version int not null default 1;
+
 -- 로그인 시도 기록 (무차별 대입 차단 + 감사 로그)
 create table if not exists public.login_attempts (
     id bigint generated always as identity primary key,
@@ -206,7 +210,7 @@ begin
         return jsonb_build_object('success', false, 'reason', 'locked');
     end if;
 
-    select id, username, password_hash, is_active, is_admin
+    select id, username, password_hash, is_active, is_admin, session_version
       into v_user
       from public.users
      where username = p_username;
@@ -231,7 +235,8 @@ begin
         'success', true,
         'id', v_user.id,
         'username', v_user.username,
-        'is_admin', v_user.is_admin
+        'is_admin', v_user.is_admin,
+        'session_version', v_user.session_version
     );
 end;
 $$;
@@ -289,6 +294,64 @@ end;
 $$;
 
 
+-- 살아 있는 세션이 여전히 유효한지 확인하기 위한 조회.
+-- found=false 는 계정이 삭제되었다는 뜻이므로 세션을 파기해야 합니다.
+create or replace function public.get_user_session_state(
+    p_secret text,
+    p_user_id bigint
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+    v record;
+begin
+    if not public.check_secret(p_secret) then
+        return jsonb_build_object('found', false, 'ok', false);
+    end if;
+
+    select is_active, is_admin, session_version into v
+      from public.users
+     where id = p_user_id;
+
+    if v is null then
+        return jsonb_build_object('found', false, 'ok', true);
+    end if;
+
+    return jsonb_build_object(
+        'found', true,
+        'ok', true,
+        'is_active', v.is_active,
+        'is_admin', v.is_admin,
+        'session_version', v.session_version
+    );
+end;
+$$;
+
+
+-- 관리자가 특정 회원의 모든 세션을 즉시 종료
+create or replace function public.force_logout_user(p_secret text, p_user_id bigint)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+    if not public.check_secret(p_secret) then
+        return jsonb_build_object('success', false);
+    end if;
+
+    update public.users
+       set session_version = session_version + 1
+     where id = p_user_id;
+
+    return jsonb_build_object('success', true);
+end;
+$$;
+
+
 -- ============================================================
 -- 4. 내 계정 관리 (비밀번호 변경 / 탈퇴)
 -- ============================================================
@@ -306,6 +369,7 @@ set search_path = public, extensions
 as $$
 declare
     v_user record;
+    v_new_version int;
 begin
     if not public.check_secret(p_secret) then
         return jsonb_build_object('success', false, 'error', '서버 인증에 실패했습니다.');
@@ -322,11 +386,15 @@ begin
         return jsonb_build_object('success', false, 'error', '현재 비밀번호가 올바르지 않습니다.');
     end if;
 
+    -- 비밀번호를 바꾸면 다른 기기의 세션은 모두 무효화됩니다.
+    -- 새 버전을 돌려주므로 요청을 보낸 본인의 세션만 이어서 유지할 수 있습니다.
     update public.users
-       set password_hash = extensions.crypt(p_new_password, extensions.gen_salt('bf'))
-     where id = p_user_id;
+       set password_hash = extensions.crypt(p_new_password, extensions.gen_salt('bf')),
+           session_version = session_version + 1
+     where id = p_user_id
+    returning session_version into v_new_version;
 
-    return jsonb_build_object('success', true);
+    return jsonb_build_object('success', true, 'session_version', v_new_version);
 end;
 $$;
 
@@ -441,8 +509,10 @@ begin
         return jsonb_build_object('success', false, 'error', '링크가 만료되었거나 이미 사용되었습니다.');
     end if;
 
+    -- 재설정은 계정 탈취 대응 수단이므로 기존 세션을 전부 무효화합니다.
     update public.users
-       set password_hash = extensions.crypt(p_new_password, extensions.gen_salt('bf'))
+       set password_hash = extensions.crypt(p_new_password, extensions.gen_salt('bf')),
+           session_version = session_version + 1
      where id = v_reset.user_id;
 
     update public.password_resets set used_at = now() where id = v_reset.id;
@@ -569,7 +639,12 @@ begin
     if not public.check_secret(p_secret) then
         return jsonb_build_object('success', false);
     end if;
-    update public.users set is_active = p_active where id = p_user_id;
+    -- 정지시킬 때는 살아 있는 세션도 함께 끊습니다.
+    update public.users
+       set is_active = p_active,
+           session_version = case when p_active then session_version
+                                  else session_version + 1 end
+     where id = p_user_id;
     return jsonb_build_object('success', true);
 end;
 $$;
@@ -587,7 +662,13 @@ begin
     if not public.check_secret(p_secret) then
         return jsonb_build_object('success', false);
     end if;
-    update public.users set is_admin = p_is_admin where id = p_user_id;
+    -- 권한을 "해제"할 때만 세션을 끊습니다. 부여할 때는 세션 검사가 60초 안에
+    -- is_admin 을 자동으로 따라가므로 굳이 재로그인시킬 필요가 없습니다.
+    update public.users
+       set is_admin = p_is_admin,
+           session_version = case when p_is_admin then session_version
+                                  else session_version + 1 end
+     where id = p_user_id;
     return jsonb_build_object('success', true);
 end;
 $$;
@@ -709,6 +790,8 @@ grant execute on function public.signup_user(text, text, text, text) to anon, au
 grant execute on function public.login_user(text, text, text, text) to anon, authenticated;
 grant execute on function public.check_login_lock(text, text, text) to anon, authenticated;
 grant execute on function public.record_login_attempt(text, text, text, boolean) to anon, authenticated;
+grant execute on function public.get_user_session_state(text, bigint) to anon, authenticated;
+grant execute on function public.force_logout_user(text, bigint) to anon, authenticated;
 grant execute on function public.change_password(text, bigint, text, text) to anon, authenticated;
 grant execute on function public.delete_own_account(text, bigint, text) to anon, authenticated;
 grant execute on function public.create_password_reset(text, text) to anon, authenticated;

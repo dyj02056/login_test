@@ -51,6 +51,10 @@
                                 <input type="hidden" name="is_admin" value="{{ '0' if u.is_admin else '1' }}">
                                 <button type="submit" class="mini">{{ '권한해제' if u.is_admin else '관리자로' }}</button>
                             </form>
+                            <form method="post" action="{{ url_for('admin_force_logout', user_id=u.id) }}">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                <button type="submit" class="mini">강제 로그아웃</button>
+                            </form>
                             <form method="post" action="{{ url_for('admin_reset_link', user_id=u.id) }}">
                                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                                 <input type="hidden" name="username" value="{{ u.username }}">
