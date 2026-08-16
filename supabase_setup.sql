@@ -40,6 +40,11 @@ create index if not exists login_attempts_username_time_idx
     on public.login_attempts (username, attempted_at desc);
 create index if not exists login_attempts_time_idx
     on public.login_attempts (attempted_at desc);
+-- 잠금 판정이 (아이디, IP) 와 IP 단독 조건을 모두 조회하므로 함께 걸어 둡니다.
+create index if not exists login_attempts_user_ip_time_idx
+    on public.login_attempts (username, ip, attempted_at desc);
+create index if not exists login_attempts_ip_time_idx
+    on public.login_attempts (ip, attempted_at desc);
 
 -- 비밀번호 재설정 토큰 (원문은 저장하지 않고 해시만 보관)
 create table if not exists public.password_resets (
@@ -111,16 +116,37 @@ revoke all on function public.check_secret(text) from public, anon, authenticate
 
 -- 로그인 잠금 판정. login_user 와 check_login_lock 이 공유하는 단일 기준점이므로
 -- 잠금 정책을 바꿀 때는 이 함수 하나만 고치면 됩니다.
+--
+-- 아이디만으로 판정하면 누구나 남의 아이디로 5번 틀려서 그 사람을 로그인 불가로
+-- 만들 수 있으므로(서비스 거부), (아이디 + IP) 조합을 기준으로 삼습니다.
+-- 공격자 IP 에서 실패가 쌓여도 피해자 IP 에서의 로그인은 막히지 않습니다.
 create or replace function public.is_login_locked(p_username text, p_ip text)
 returns boolean
 language sql
 security definer
 set search_path = public
 as $$
-    select (select count(*) from public.login_attempts
-             where username = p_username
-               and not success
-               and attempted_at > now() - interval '15 minutes') >= 5;
+    select case
+        -- IP 를 알 수 없으면 아이디 기준으로만 판정 (임계값을 올려 오탐을 줄임)
+        when coalesce(p_ip, '') = '' then
+            (select count(*) from public.login_attempts
+              where username = p_username
+                and not success
+                and attempted_at > now() - interval '15 minutes') >= 10
+        else
+            -- 같은 (아이디, IP) 에서 5회 실패 → 해당 계정 대입 차단
+            (select count(*) from public.login_attempts
+              where username = p_username
+                and ip = p_ip
+                and not success
+                and attempted_at > now() - interval '15 minutes') >= 5
+            or
+            -- 같은 IP 에서 아이디 불문 20회 실패 → 여러 계정을 훑는 공격 차단
+            (select count(*) from public.login_attempts
+              where ip = p_ip
+                and not success
+                and attempted_at > now() - interval '15 minutes') >= 20
+    end;
 $$;
 
 revoke all on function public.is_login_locked(text, text) from public, anon, authenticated;
