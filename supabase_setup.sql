@@ -56,16 +56,26 @@ create table if not exists public.app_settings (
     constraint app_settings_singleton check (id = true)
 );
 
-insert into public.app_settings (id, signup_enabled)
-values (true, true)
-on conflict (id) do nothing;
-
 -- 서버(Flask)만 알고 있어야 하는 RPC 호출용 비밀키.
 -- publishable 키가 유출되어도 이 값이 없으면 아래 함수들을 호출할 수 없습니다.
+--
+-- 컬럼 준비를 아래 INSERT 보다 반드시 먼저 해야 합니다. PostgreSQL 은 ON CONFLICT 로
+-- 넘어가기 전에 NOT NULL 을 먼저 검사하므로, 순서가 뒤바뀌면 재실행 시
+-- "null value in column rpc_secret" 오류가 납니다.
 alter table public.app_settings add column if not exists rpc_secret text;
+alter table public.app_settings
+    alter column rpc_secret set default extensions.gen_random_uuid()::text;
+
+-- 설정 행이 없을 때만 생성 (이미 있으면 아무 것도 하지 않음)
+insert into public.app_settings (id, signup_enabled)
+select true, true
+where not exists (select 1 from public.app_settings where id = true);
+
+-- 기존 설치본에 비밀키가 없으면 채움. 이미 있으면 값을 유지합니다.
 update public.app_settings
    set rpc_secret = extensions.gen_random_uuid()::text
  where rpc_secret is null;
+
 alter table public.app_settings alter column rpc_secret set not null;
 
 -- 모든 테이블 RLS 활성화 + 정책 없음 => anon 키로 직접 접근 불가.
@@ -93,6 +103,23 @@ as $$
 $$;
 
 revoke all on function public.check_secret(text) from public, anon, authenticated;
+
+
+-- 로그인 잠금 판정. login_user 와 check_login_lock 이 공유하는 단일 기준점이므로
+-- 잠금 정책을 바꿀 때는 이 함수 하나만 고치면 됩니다.
+create or replace function public.is_login_locked(p_username text, p_ip text)
+returns boolean
+language sql
+security definer
+set search_path = public
+as $$
+    select (select count(*) from public.login_attempts
+             where username = p_username
+               and not success
+               and attempted_at > now() - interval '15 minutes') >= 5;
+$$;
+
+revoke all on function public.is_login_locked(text, text) from public, anon, authenticated;
 
 
 -- 이전 버전의 함수 시그니처 제거 (인자가 바뀌었으므로)
@@ -167,20 +194,13 @@ set search_path = public, extensions
 as $$
 declare
     v_user record;
-    v_fails int;
     v_ok boolean := false;
 begin
     if not public.check_secret(p_secret) then
         return jsonb_build_object('success', false, 'reason', 'secret');
     end if;
 
-    select count(*) into v_fails
-      from public.login_attempts
-     where username = p_username
-       and success = false
-       and attempted_at > now() - interval '15 minutes';
-
-    if v_fails >= 5 then
+    if public.is_login_locked(p_username, p_ip) then
         insert into public.login_attempts (username, ip, success)
         values (p_username, p_ip, false);
         return jsonb_build_object('success', false, 'reason', 'locked');
@@ -213,6 +233,58 @@ begin
         'username', v_user.username,
         'is_admin', v_user.is_admin
     );
+end;
+$$;
+
+
+-- 로그인 전 잠금 여부만 확인. 환경변수 관리자처럼 DB 를 거치지 않는 로그인 경로도
+-- 동일한 제한을 받도록 하기 위해 분리했습니다.
+create or replace function public.check_login_lock(
+    p_secret text,
+    p_username text,
+    p_ip text default null
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+    -- 비밀키가 틀리면 잠기지 않은 것으로 봅니다. 비밀키 오류로 DB 경로가 전부 막힌
+    -- 상황에서 환경변수 관리자는 유일한 복구 통로여야 하기 때문입니다.
+    if not public.check_secret(p_secret) then
+        return jsonb_build_object('locked', false, 'ok', false);
+    end if;
+
+    return jsonb_build_object(
+        'locked', public.is_login_locked(p_username, p_ip),
+        'ok', true
+    );
+end;
+$$;
+
+
+-- 로그인 시도 기록. DB 를 거치지 않는 로그인 경로에서 직접 호출합니다.
+create or replace function public.record_login_attempt(
+    p_secret text,
+    p_username text,
+    p_ip text,
+    p_success boolean
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+    if not public.check_secret(p_secret) then
+        return jsonb_build_object('success', false);
+    end if;
+
+    insert into public.login_attempts (username, ip, success)
+    values (p_username, p_ip, p_success);
+
+    return jsonb_build_object('success', true);
 end;
 $$;
 
@@ -635,6 +707,8 @@ $$;
 
 grant execute on function public.signup_user(text, text, text, text) to anon, authenticated;
 grant execute on function public.login_user(text, text, text, text) to anon, authenticated;
+grant execute on function public.check_login_lock(text, text, text) to anon, authenticated;
+grant execute on function public.record_login_attempt(text, text, text, boolean) to anon, authenticated;
 grant execute on function public.change_password(text, bigint, text, text) to anon, authenticated;
 grant execute on function public.delete_own_account(text, bigint, text) to anon, authenticated;
 grant execute on function public.create_password_reset(text, text) to anon, authenticated;

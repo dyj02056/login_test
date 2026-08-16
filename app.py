@@ -179,13 +179,25 @@ def login():
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
         remember = request.form.get("remember") == "on"
+        ip = client_ip()
 
-        # 비상용 환경변수 관리자
-        if (
-            ADMIN_USERNAME
-            and hmac.compare_digest(username, ADMIN_USERNAME)
-            and hmac.compare_digest(password, ADMIN_PASSWORD)
-        ):
+        # 아이디 종류와 무관하게 잠금을 가장 먼저 판정합니다.
+        # 환경변수 관리자도 이 검사를 통과해야만 다음으로 넘어갑니다.
+        if rpc("check_login_lock", {"p_username": username, "p_ip": ip}).get("locked"):
+            flash("로그인 시도가 너무 많습니다. 15분 후 다시 시도해 주세요.", "error")
+            return render_template("login.html", username=username)
+
+        # 비상용 환경변수 관리자. DB 를 거치지 않으므로 기록도 직접 남깁니다.
+        if ADMIN_USERNAME and hmac.compare_digest(username, ADMIN_USERNAME):
+            success = hmac.compare_digest(password, ADMIN_PASSWORD)
+            rpc(
+                "record_login_attempt",
+                {"p_username": username, "p_ip": ip, "p_success": success},
+            )
+            if not success:
+                flash("아이디 또는 비밀번호가 올바르지 않습니다.", "error")
+                return render_template("login.html", username=username)
+
             session.clear()
             session["is_admin"] = True
             session["username"] = username
@@ -194,7 +206,7 @@ def login():
 
         result = rpc(
             "login_user",
-            {"p_username": username, "p_password": password, "p_ip": client_ip()},
+            {"p_username": username, "p_password": password, "p_ip": ip},
         )
 
         if not result.get("success"):
