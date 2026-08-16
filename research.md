@@ -6,8 +6,8 @@
 
 > **진행 상황 (2026-08-16 갱신)**
 > `plan.md` 에 따라 ① ③ ④ 를 수정하고 각각 검증을 마쳤습니다.
-> 커밋: `16ebea0`(①) · `b2924d9`(③) · `7d9343c`(④)
-> 남은 항목: ② ⑤ ⑥ ⑦ ⑧ ⑨ ⑩
+> 커밋: `16ebea0`(①) · `b2924d9`(③) · `7d9343c`(④) · `16fb665`(②⑨) · `493b9c7`(⑥⑦)
+> 남은 항목: ⑤(가입·재설정 속도 제한) · ⑧(이메일 인증) · ⑩(운영 주의)
 
 ---
 
@@ -15,20 +15,22 @@
 
 ```
 login_test/
-├── app.py                  526줄  Flask 서버 — 라우트 19개, 전체 로직의 유일한 진입점
-├── supabase_setup.sql      660줄  DB 스키마 4개 + RPC 함수 16개 (비즈니스 로직의 절반이 여기 있음)
+├── app.py                  712줄  Flask 서버 — 라우트 21개, 전체 로직의 유일한 진입점
+├── supabase_setup.sql      986줄  DB 테이블 5개 + RPC 함수 25개 (비즈니스 로직의 절반이 여기 있음)
 ├── requirements.txt          4줄  Flask, Flask-WTF, requests, python-dotenv
 ├── .env                          실제 비밀값 (git 제외됨)
 ├── .env.example                  환경변수 템플릿
 ├── .gitignore                    __pycache__, *.pyc, users.db, *.log, .env, venv/
-├── features_guide.pdf            기능 설명서 (6페이지)
+├── features_guide.pdf            기능 설명서 (8페이지)
+├── research.md / plan.md         이 문서 및 수정 계획서
 ├── static/
-│   └── style.css           449줄  전체 스타일 (프레임워크 없음)
+│   ├── style.css           449줄  전체 스타일 (프레임워크 없음)
+│   └── app.js               18줄  확인창·그래프 높이 (CSP 때문에 인라인 금지)
 └── templates/              14개   Jinja2 템플릿
     ├── base.html                 공통 레이아웃 + 관리자 네비 + flash 메시지 출력
     ├── login/signup/dashboard    일반 회원 화면
     ├── change_password / delete_account / forgot_password / reset_password
-    ├── admin / admin_users / admin_logs / admin_stats
+    ├── admin / admin_users / admin_logs / admin_audit / admin_stats
     └── error.html                404 / 500 / 503 공용
 ```
 
@@ -54,9 +56,9 @@ login_test/
 | 회원 검색 | **있음** — `list_users(p_search)`, `username ilike` | 이메일 검색은 미지원 → 확장 여지 |
 | 관리자 권한 관리 | **있음** — `set_user_admin` + DB `is_admin` | 신규 불필요 |
 | 가입 통계 | **있음** — `get_signup_stats` (일별 + 요약 5종) | 로그인 통계는 없음 → 확장 여지 |
-| 세션 관리 / 강제 로그아웃 | **없음** | 신규 필요 (5절 위험 ③과 직결) |
+| 세션 관리 / 강제 로그아웃 | ~~없음~~ → **구현됨** (`force_logout_user`) | 완료 |
 | 이메일 인증 | **없음** — 이메일 컬럼만 있고 검증 없음 | 신규 필요 |
-| 감사 로그(관리자 행위) | **없음** — 로그인 시도만 기록, 삭제·정지는 흔적 없음 | 신규 필요 |
+| 감사 로그(관리자 행위) | ~~없음~~ → **구현됨** (`/admin/audit`) | 완료 |
 | 2단계 인증(2FA) | **없음** | 신규 |
 | 소셜 로그인 | **없음** | 신규 (규모 큼) |
 
@@ -77,6 +79,9 @@ login_test/
 ---
 
 ## 3. 주요 함수 / 데이터 흐름
+
+> 아래 줄 번호는 분석 시점(`9e4e254`) 기준입니다. 이후 수정으로 위치가 밀렸으므로
+> 흐름을 이해하는 용도로만 참고하고, 정확한 위치는 함수 이름으로 찾으세요.
 
 ### 3-1. 모든 DB 접근의 단일 통로 — `rpc()` (`app.py:56`)
 
@@ -152,7 +157,7 @@ session["is_admin"] ─┬─ 환경변수 관리자 로그인 시 True    app.p
 
 ## 4. 기존 API / 컴포넌트 목록
 
-### 4-1. Flask 라우트 (19개)
+### 4-1. Flask 라우트 (21개)
 
 | 경로 | 메서드 | 보호 | 호출하는 RPC |
 |---|---|---|---|
@@ -172,17 +177,28 @@ session["is_admin"] ─┬─ 환경변수 관리자 로그인 시 True    app.p
 | `/admin/users/<id>/toggle-admin` | POST | `@admin_required` | `set_user_admin` |
 | `/admin/users/<id>/delete` | POST | `@admin_required` | `admin_delete_user` |
 | `/admin/users/<id>/reset-link` | POST | `@admin_required` | `create_password_reset` |
+| `/admin/users/<id>/force-logout` | POST | `@admin_required` | `force_logout_user` |
 | `/admin/logs` | GET | `@admin_required` | `get_login_attempts` |
 | `/admin/unlock` | POST | `@admin_required` | `clear_login_attempts` |
+| `/admin/audit` | GET | `@admin_required` | `get_admin_actions` |
 | `/admin/stats` | GET | `@admin_required` | `get_signup_stats` |
 
-### 4-2. Postgres RPC 함수 (16개)
+모든 관리자 POST 라우트는 수행 후 `log_admin_action` 을 호출해 감사 로그를 남깁니다.
+
+### 4-2. Postgres RPC 함수 (25개)
 
 전부 `security definer` + 첫 인자 `p_secret` 필수. `check_secret()`은 anon 권한 미부여.
 
 | 함수 | 용도 |
 |---|---|
-| `check_secret` | 내부 전용 — 비밀키 검증 |
+| `check_secret` | 내부 전용 — 비밀키 검증 (anon 권한 없음) |
+| `is_login_locked` | 내부 전용 — 잠금 판정의 단일 기준점 (아이디+IP) |
+| `check_login_lock` | 로그인 전 잠금 확인 (환경변수 관리자 경로용) |
+| `record_login_attempt` | 시도 기록 (DB 를 거치지 않는 로그인 경로용) |
+| `get_user_session_state` | 살아 있는 세션의 유효성 확인 |
+| `force_logout_user` | 특정 회원의 모든 세션 종료 |
+| `log_admin_action` / `get_admin_actions` | 관리자 행위 기록 / 조회 |
+| `prune_old_records` | 오래된 기록 정리 (하루 1회 자체 제한) |
 | `signup_user` | 가입 (길이·중복·가입허용 재검증 + bcrypt) |
 | `login_user` | 로그인 (잠금 판정 + 검증 + 기록) |
 | `change_password` | 기존 비번 확인 후 변경 |
@@ -241,7 +257,11 @@ dyj02056 계정으로 6회 실패 → 상태: "잠김"
 > 조치: 환경변수 관리자 검사를 `login_user` 호출 **뒤로** 옮기거나, 별도의
 > 시도 횟수 카운터를 두고 성공/실패 모두 `login_attempts`에 기록.
 
-### ② 검증되지 않은 Referer 리다이렉트 — **중간 · 재현 확인됨**
+### ② 검증되지 않은 Referer 리다이렉트 — **중간 · 재현 확인됨** → ✅ **해결됨 (`16fb665`)**
+
+> `safe_redirect()` 를 도입해 같은 출처일 때만 Referer 로 돌아가고,
+> 아니면 지정한 엔드포인트로 보냅니다. 재검증: 외부 Referer 는 무시되고
+> 내부 경로(`?page=2` 포함)는 그대로 유지됨을 확인.
 
 `app.py:429, 441, 449, 462, 491` — 5곳이 `redirect(request.referrer or ...)`.
 
@@ -297,7 +317,11 @@ CSRF 토큰이 외부 사이트발 요청을 막아주므로 **실제 악용 난
 `/signup`과 `/forgot-password`에는 아무 제한이 없습니다.
 스크립트로 계정을 무한 생성하거나 `password_resets` 행을 무한 적재할 수 있습니다.
 
-### ⑥ 테이블 무한 증가 — **낮음(운영) · 코드 검토**
+### ⑥ 테이블 무한 증가 — **낮음(운영) · 코드 검토** → ✅ **해결됨 (`493b9c7`)**
+
+> `prune_old_records()` 추가. login_attempts 90일, 사용된 재설정 토큰,
+> 감사 로그 1년 기준으로 삭제합니다. 하루 1회만 실제 동작하도록 자체 제한하며
+> 관리자가 콘솔에 들어올 때 호출되므로 별도 스케줄러가 필요 없습니다.
 
 `login_attempts`와 `password_resets`는 **삭제 로직이 없습니다.**
 `login_attempts`는 모든 로그인 시도마다 1행씩 쌓이며, 잠금 판정 쿼리가 매 로그인마다
@@ -305,7 +329,12 @@ CSRF 토큰이 외부 사이트발 요청을 막아주므로 **실제 악용 난
 
 > 조치: `attempted_at < now() - interval '90 days'` 정리 + Supabase cron.
 
-### ⑦ 관리자 행위에 감사 기록이 없음 — **중간 · 코드 검토**
+### ⑦ 관리자 행위에 감사 기록이 없음 — **중간 · 코드 검토** → ✅ **해결됨 (`493b9c7`)**
+
+> `admin_actions` 테이블과 `/admin/audit` 화면을 추가했습니다.
+> 정지·활성화·권한 부여/해제·삭제·강제 로그아웃·재설정 링크 발급·잠금 해제·
+> 회원가입 on/off 총 9종을 수행자·대상·IP 와 함께 기록합니다.
+> 대상 아이디를 함께 저장해 회원이 삭제된 뒤에도 추적이 가능합니다.
 
 회원 삭제·정지·권한부여는 **아무 흔적도 남지 않습니다.** 관리자가 여럿이 되면
 (현재 `set_user_admin`으로 늘릴 수 있음) 누가 무엇을 지웠는지 추적이 불가능합니다.
@@ -317,7 +346,11 @@ CSRF 토큰이 외부 사이트발 요청을 막아주므로 **실제 악용 난
 영영 도착하지 않고, 남의 이메일을 적어도 막히지 않습니다.
 현재는 메일 발송이 비활성이라 영향이 적지만, Resend를 켜는 순간 문제가 됩니다.
 
-### ⑨ 보안 헤더 부재 — **낮음 · 코드 검토**
+### ⑨ 보안 헤더 부재 — **낮음 · 코드 검토** → ✅ **해결됨 (`16fb665`)**
+
+> CSP · X-Frame-Options · X-Content-Type-Options · Referrer-Policy 를 추가하고
+> 배포 환경에서는 HSTS 도 보냅니다. 인라인 스크립트·스타일 2곳을
+> `static/app.js` 로 옮겨 `'unsafe-inline'` 없이 엄격한 CSP 를 적용했습니다.
 
 CSP, X-Frame-Options, HSTS가 없습니다. 관리자 콘솔이 iframe에 삽입될 수 있어
 클릭재킹으로 "삭제" 버튼을 누르게 만들 여지가 있습니다.
@@ -392,6 +425,9 @@ CSP, X-Frame-Options, HSTS가 없습니다. 관리자 콘솔이 iframe에 삽입
 
 ①③④ 수정을 완료했습니다. 각 항목의 검증 결과는 위 5절에 표시해 두었습니다.
 
-다음 우선순위는 **⑦ 관리자 행위 감사 로그**입니다. ③을 구현하면서 관리자가
-회원 세션을 강제 종료할 수 있게 되어 관리자 권한이 더 강해졌는데, 정작 그 행위가
-아무 기록도 남기지 않기 때문입니다. 그다음은 ② · ⑥ · ⑨ (각각 1시간 이내) 입니다.
+① ② ③ ④ ⑥ ⑦ ⑨ 를 모두 처리했습니다. 각 항목의 검증 결과는 위 5절에 표시해 두었습니다.
+
+남은 것은 ⑤(가입·재설정 속도 제한) · ⑧(이메일 인증) · ⑩(운영 주의)입니다.
+⑤ 는 함수 시그니처가 바뀌어 SQL 과 코드를 함께 배포해야 하는 유일한 항목이고,
+⑧ 은 메일 발송(Resend)을 켜기 전까지는 실효가 없습니다.
+⑩ 은 코드 변경이 아니라 운영 습관에 대한 것이라 그대로 남겨 둡니다.
