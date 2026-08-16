@@ -28,7 +28,7 @@
         <div class="chart">
             {% for d in daily %}
                 <div class="bar-wrap" title="{{ d.day }} — {{ d.count }}명">
-                    <div class="bar" style="height: {{ (d.count / peak * 100) | round | int }}%"></div>
+                    <div class="bar" data-height="{{ (d.count / peak * 100) | round | int }}"></div>
                     <span class="bar-label">{{ d.day[-2:] }}</span>
                 </div>
             {% endfor %}

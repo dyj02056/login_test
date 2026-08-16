@@ -61,7 +61,7 @@
                                 <button type="submit" class="mini">재설정 링크</button>
                             </form>
                             <form method="post" action="{{ url_for('admin_delete_user', user_id=u.id) }}"
-                                  onsubmit="return confirm('{{ u.username }} 회원을 삭제할까요? 되돌릴 수 없습니다.');">
+                                  data-confirm="{{ u.username }} 회원을 삭제할까요? 되돌릴 수 없습니다.">
                                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                                 <button type="submit" class="mini danger">삭제</button>
                             </form>

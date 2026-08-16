@@ -4,6 +4,7 @@ import time
 from datetime import timedelta
 from functools import wraps
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 from dotenv import load_dotenv
@@ -46,6 +47,31 @@ app.config.update(
 csrf = CSRFProtect(app)
 
 
+@app.after_request
+def set_security_headers(response):
+    """브라우저 쪽 방어선. 인라인 스크립트·스타일을 쓰지 않으므로
+    'unsafe-inline' 없이 엄격한 정책을 적용할 수 있습니다."""
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; "
+        "script-src 'self'; "
+        "style-src 'self'; "
+        "img-src 'self' data:; "
+        "form-action 'self'; "
+        "frame-ancestors 'none'; "
+        "base-uri 'self'; "
+        "object-src 'none'",
+    )
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "same-origin")
+    if os.environ.get("VERCEL"):
+        response.headers.setdefault(
+            "Strict-Transport-Security", "max-age=31536000; includeSubDomains"
+        )
+    return response
+
+
 # ----------------------------------------------------------------------
 # Supabase 호출
 # ----------------------------------------------------------------------
@@ -80,6 +106,20 @@ def client_ip():
     if forwarded:
         return forwarded.split(",")[0].strip()
     return request.remote_addr or ""
+
+
+def safe_redirect(fallback_endpoint):
+    """직전 페이지로 돌아가되, 외부 주소로는 절대 보내지 않는다.
+
+    Referer 는 요청자가 조종할 수 있으므로 그대로 믿고 리다이렉트하면
+    피싱 사이트로 유도하는 통로가 된다.
+    """
+    target = request.referrer
+    if target:
+        parsed = urlparse(target)
+        if not parsed.netloc or parsed.netloc == urlparse(request.host_url).netloc:
+            return redirect(target)
+    return redirect(url_for(fallback_endpoint))
 
 
 def is_signup_enabled():
@@ -493,7 +533,7 @@ def admin_toggle_active(user_id):
     active = request.form.get("active") == "1"
     rpc("set_user_active", {"p_user_id": user_id, "p_active": active})
     flash("계정을 활성화했습니다." if active else "계정을 정지했습니다.", "success")
-    return redirect(request.referrer or url_for("admin_users"))
+    return safe_redirect("admin_users")
 
 
 @app.route("/admin/users/<int:user_id>/toggle-admin", methods=["POST"])
@@ -505,7 +545,7 @@ def admin_toggle_admin(user_id):
         "관리자 권한을 부여했습니다." if make_admin else "관리자 권한을 해제했습니다.",
         "success",
     )
-    return redirect(request.referrer or url_for("admin_users"))
+    return safe_redirect("admin_users")
 
 
 @app.route("/admin/users/<int:user_id>/delete", methods=["POST"])
@@ -513,7 +553,7 @@ def admin_toggle_admin(user_id):
 def admin_delete_user(user_id):
     rpc("admin_delete_user", {"p_user_id": user_id})
     flash("회원을 삭제했습니다.", "success")
-    return redirect(request.referrer or url_for("admin_users"))
+    return safe_redirect("admin_users")
 
 
 @app.route("/admin/users/<int:user_id>/force-logout", methods=["POST"])
@@ -521,7 +561,7 @@ def admin_delete_user(user_id):
 def admin_force_logout(user_id):
     rpc("force_logout_user", {"p_user_id": user_id})
     flash("해당 회원의 모든 세션을 종료했습니다.", "success")
-    return redirect(request.referrer or url_for("admin_users"))
+    return safe_redirect("admin_users")
 
 
 @app.route("/admin/users/<int:user_id>/reset-link", methods=["POST"])
@@ -534,7 +574,7 @@ def admin_reset_link(user_id):
         flash(f"재설정 링크(1시간 유효): {link}", "success")
     else:
         flash("링크 생성에 실패했습니다.", "error")
-    return redirect(request.referrer or url_for("admin_users"))
+    return safe_redirect("admin_users")
 
 
 @app.route("/admin/logs")
@@ -563,7 +603,7 @@ def admin_unlock():
     if username:
         rpc("clear_login_attempts", {"p_username": username})
         flash(f"'{username}' 계정의 로그인 잠금을 해제했습니다.", "success")
-    return redirect(request.referrer or url_for("admin_logs"))
+    return safe_redirect("admin_logs")
 
 
 @app.route("/admin/stats")
