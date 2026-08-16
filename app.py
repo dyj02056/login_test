@@ -129,6 +129,28 @@ def is_signup_enabled():
         return True
 
 
+def log_admin(action, target_user_id=None, target_username=None, detail=None):
+    """관리자 행위를 감사 로그에 남긴다.
+
+    기록에 실패해도 이미 수행된 작업을 되돌릴 수는 없으므로, 요청을 실패시키는
+    대신 관리자에게 경고를 띄워 기록이 누락되었음을 알린다.
+    """
+    try:
+        rpc(
+            "log_admin_action",
+            {
+                "p_actor": session.get("username") or "(unknown)",
+                "p_action": action,
+                "p_target_user_id": target_user_id,
+                "p_target_username": target_username,
+                "p_detail": detail,
+                "p_ip": client_ip(),
+            },
+        )
+    except SupabaseError:
+        flash("작업은 완료되었지만 감사 로그 기록에 실패했습니다.", "error")
+
+
 # ----------------------------------------------------------------------
 # 접근 제어 데코레이터
 # ----------------------------------------------------------------------
@@ -480,6 +502,13 @@ def reset_password(token):
 @app.route("/admin")
 @admin_required
 def admin_panel():
+    # 오래된 기록 정리. 함수 안에서 하루에 한 번만 실제로 동작하므로
+    # 관리자가 화면에 들어올 때마다 불러도 부담이 없습니다.
+    try:
+        rpc("prune_old_records", {"p_days": 90})
+    except SupabaseError:
+        pass
+
     stats = rpc("get_signup_stats", {"p_days": 14})
     return render_template(
         "admin.html",
@@ -494,6 +523,7 @@ def admin_panel():
 def admin_toggle_signup():
     new_state = not is_signup_enabled()
     rpc("set_signup_enabled", {"p_enabled": new_state})
+    log_admin("signup_enabled" if new_state else "signup_disabled")
     flash(
         "회원가입을 켰습니다." if new_state else "회원가입을 껐습니다.",
         "success",
@@ -532,6 +562,11 @@ def admin_users():
 def admin_toggle_active(user_id):
     active = request.form.get("active") == "1"
     rpc("set_user_active", {"p_user_id": user_id, "p_active": active})
+    log_admin(
+        "activate_user" if active else "suspend_user",
+        target_user_id=user_id,
+        target_username=request.form.get("username"),
+    )
     flash("계정을 활성화했습니다." if active else "계정을 정지했습니다.", "success")
     return safe_redirect("admin_users")
 
@@ -541,6 +576,11 @@ def admin_toggle_active(user_id):
 def admin_toggle_admin(user_id):
     make_admin = request.form.get("is_admin") == "1"
     rpc("set_user_admin", {"p_user_id": user_id, "p_is_admin": make_admin})
+    log_admin(
+        "grant_admin" if make_admin else "revoke_admin",
+        target_user_id=user_id,
+        target_username=request.form.get("username"),
+    )
     flash(
         "관리자 권한을 부여했습니다." if make_admin else "관리자 권한을 해제했습니다.",
         "success",
@@ -552,6 +592,11 @@ def admin_toggle_admin(user_id):
 @admin_required
 def admin_delete_user(user_id):
     rpc("admin_delete_user", {"p_user_id": user_id})
+    log_admin(
+        "delete_user",
+        target_user_id=user_id,
+        target_username=request.form.get("username"),
+    )
     flash("회원을 삭제했습니다.", "success")
     return safe_redirect("admin_users")
 
@@ -560,6 +605,11 @@ def admin_delete_user(user_id):
 @admin_required
 def admin_force_logout(user_id):
     rpc("force_logout_user", {"p_user_id": user_id})
+    log_admin(
+        "force_logout",
+        target_user_id=user_id,
+        target_username=request.form.get("username"),
+    )
     flash("해당 회원의 모든 세션을 종료했습니다.", "success")
     return safe_redirect("admin_users")
 
@@ -571,6 +621,7 @@ def admin_reset_link(user_id):
     result = rpc("create_password_reset", {"p_username": username})
     if result.get("issued"):
         link = url_for("reset_password", token=result["token"], _external=True)
+        log_admin("issue_reset_link", target_user_id=user_id, target_username=username)
         flash(f"재설정 링크(1시간 유효): {link}", "success")
     else:
         flash("링크 생성에 실패했습니다.", "error")
@@ -602,8 +653,28 @@ def admin_unlock():
     username = request.form.get("username", "").strip()
     if username:
         rpc("clear_login_attempts", {"p_username": username})
+        log_admin("unlock_account", target_username=username)
         flash(f"'{username}' 계정의 로그인 잠금을 해제했습니다.", "success")
     return safe_redirect("admin_logs")
+
+
+@app.route("/admin/audit")
+@admin_required
+def admin_audit():
+    page = max(1, request.args.get("page", 1, type=int))
+    per_page = 50
+    data = rpc(
+        "get_admin_actions",
+        {"p_limit": per_page, "p_offset": (page - 1) * per_page},
+    )
+    total = data.get("total", 0)
+    return render_template(
+        "admin_audit.html",
+        actions=data.get("actions", []),
+        total=total,
+        page=page,
+        pages=max(1, (total + per_page - 1) // per_page),
+    )
 
 
 @app.route("/admin/stats")

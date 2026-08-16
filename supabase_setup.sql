@@ -58,6 +58,23 @@ create table if not exists public.password_resets (
 
 create index if not exists password_resets_user_idx on public.password_resets (user_id);
 
+-- 관리자 행위 감사 로그.
+-- 대상 아이디를 함께 저장해 두므로 회원이 삭제된 뒤에도 누가 무엇을 지웠는지 남습니다.
+create table if not exists public.admin_actions (
+    id bigint generated always as identity primary key,
+    actor text not null,
+    action text not null,
+    target_user_id bigint,
+    target_username text,
+    detail text,
+    ip text,
+    created_at timestamptz not null default now()
+);
+
+create index if not exists admin_actions_time_idx
+    on public.admin_actions (created_at desc);
+
+
 -- 앱 전역 설정 (단일 행)
 create table if not exists public.app_settings (
     id boolean primary key default true,
@@ -93,6 +110,10 @@ alter table public.users enable row level security;
 alter table public.login_attempts enable row level security;
 alter table public.password_resets enable row level security;
 alter table public.app_settings enable row level security;
+alter table public.admin_actions enable row level security;
+
+-- 오래된 기록을 언제 마지막으로 정리했는지 (자동 정리 주기 판단용)
+alter table public.app_settings add column if not exists last_pruned_at timestamptz;
 
 
 -- ============================================================
@@ -767,6 +788,125 @@ end;
 $$;
 
 
+-- 관리자 행위 기록
+create or replace function public.log_admin_action(
+    p_secret text,
+    p_actor text,
+    p_action text,
+    p_target_user_id bigint default null,
+    p_target_username text default null,
+    p_detail text default null,
+    p_ip text default null
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+    if not public.check_secret(p_secret) then
+        return jsonb_build_object('success', false);
+    end if;
+
+    insert into public.admin_actions
+        (actor, action, target_user_id, target_username, detail, ip)
+    values
+        (p_actor, p_action, p_target_user_id, p_target_username, p_detail, p_ip);
+
+    return jsonb_build_object('success', true);
+end;
+$$;
+
+
+create or replace function public.get_admin_actions(
+    p_secret text,
+    p_limit int default 50,
+    p_offset int default 0
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+    v_rows jsonb;
+    v_total int;
+begin
+    if not public.check_secret(p_secret) then
+        return jsonb_build_object('total', 0, 'actions', '[]'::jsonb);
+    end if;
+
+    select count(*) into v_total from public.admin_actions;
+
+    select coalesce(jsonb_agg(t order by t.created_at desc), '[]'::jsonb) into v_rows
+      from (
+        select id, actor, action, target_user_id, target_username,
+               detail, ip, created_at
+          from public.admin_actions
+         order by created_at desc
+         limit p_limit offset p_offset
+      ) t;
+
+    return jsonb_build_object('total', v_total, 'actions', v_rows);
+end;
+$$;
+
+
+-- 오래된 기록 정리.
+-- login_attempts 는 로그인마다 1행씩 쌓이고 잠금 판정이 매번 이 테이블을 읽으므로
+-- 방치하면 로그인이 점점 느려집니다.
+--
+-- p_force = false 이면 마지막 정리 후 하루가 지났을 때만 실제로 동작합니다.
+-- 관리자 화면 진입 시 호출해도 부담이 없도록 하기 위한 장치입니다.
+create or replace function public.prune_old_records(
+    p_secret text,
+    p_days int default 90,
+    p_force boolean default false
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+    v_last timestamptz;
+    v_attempts int;
+    v_resets int;
+begin
+    if not public.check_secret(p_secret) then
+        return jsonb_build_object('success', false, 'ran', false);
+    end if;
+
+    select last_pruned_at into v_last from public.app_settings where id = true;
+
+    if not p_force and v_last is not null and v_last > now() - interval '1 day' then
+        return jsonb_build_object('success', true, 'ran', false);
+    end if;
+
+    delete from public.login_attempts
+     where attempted_at < now() - (p_days || ' days')::interval;
+    get diagnostics v_attempts = row_count;
+
+    -- 이미 쓰였거나 만료된 재설정 토큰은 보관할 이유가 없습니다.
+    delete from public.password_resets
+     where used_at is not null or expires_at < now() - interval '7 days';
+    get diagnostics v_resets = row_count;
+
+    -- 감사 로그는 더 오래 (1년) 보관합니다.
+    delete from public.admin_actions
+     where created_at < now() - interval '365 days';
+
+    update public.app_settings set last_pruned_at = now() where id = true;
+
+    return jsonb_build_object(
+        'success', true, 'ran', true,
+        'deleted_attempts', v_attempts,
+        'deleted_resets', v_resets
+    );
+end;
+$$;
+
+
 -- 가입 통계 (최근 N일)
 create or replace function public.get_signup_stats(p_secret text, p_days int default 14)
 returns jsonb
@@ -832,6 +972,9 @@ grant execute on function public.admin_delete_user(text, bigint) to anon, authen
 grant execute on function public.get_login_attempts(text, int, int) to anon, authenticated;
 grant execute on function public.clear_login_attempts(text, text) to anon, authenticated;
 grant execute on function public.get_signup_stats(text, int) to anon, authenticated;
+grant execute on function public.log_admin_action(text, text, text, bigint, text, text, text) to anon, authenticated;
+grant execute on function public.get_admin_actions(text, int, int) to anon, authenticated;
+grant execute on function public.prune_old_records(text, int, boolean) to anon, authenticated;
 
 
 -- ============================================================

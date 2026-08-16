@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% block title %}관리자 활동 기록{% endblock %}
+{% block card_class %}wide{% endblock %}
+{% set labels = {
+    'signup_enabled': '회원가입 켜기',
+    'signup_disabled': '회원가입 끄기',
+    'suspend_user': '계정 정지',
+    'activate_user': '계정 활성화',
+    'grant_admin': '관리자 권한 부여',
+    'revoke_admin': '관리자 권한 해제',
+    'delete_user': '회원 삭제',
+    'force_logout': '강제 로그아웃',
+    'issue_reset_link': '재설정 링크 발급',
+    'unlock_account': '로그인 잠금 해제'
+} %}
+{% block content %}
+    <h1>관리자 활동 기록</h1>
+    <p class="subtle">전체 {{ total }}건 · 1년간 보관</p>
+
+    <p class="hint-block">
+        회원 정지·삭제·권한 변경처럼 되돌리기 어려운 작업이 누구에 의해 언제
+        일어났는지 남깁니다. 삭제된 회원의 아이디도 함께 저장되므로
+        계정이 사라진 뒤에도 추적할 수 있습니다.
+    </p>
+
+    {% if actions %}
+        <div class="table-scroll">
+        <table>
+            <thead>
+                <tr>
+                    <th>시각</th><th>수행자</th><th>작업</th>
+                    <th>대상</th><th>IP</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for a in actions %}
+                    <tr>
+                        <td class="mono subtle">{{ a.created_at[:19].replace('T', ' ') }}</td>
+                        <td><strong>{{ a.actor }}</strong></td>
+                        <td>
+                            {% if a.action in ('delete_user', 'suspend_user', 'revoke_admin') %}
+                                <span class="badge danger">{{ labels.get(a.action, a.action) }}</span>
+                            {% elif a.action in ('grant_admin', 'signup_enabled', 'activate_user') %}
+                                <span class="badge ok">{{ labels.get(a.action, a.action) }}</span>
+                            {% else %}
+                                <span class="badge admin">{{ labels.get(a.action, a.action) }}</span>
+                            {% endif %}
+                        </td>
+                        <td>
+                            {% if a.target_username %}
+                                {{ a.target_username }}
+                                {% if a.target_user_id %}
+                                    <span class="mono subtle">#{{ a.target_user_id }}</span>
+                                {% endif %}
+                            {% else %}
+                                <span class="subtle">-</span>
+                            {% endif %}
+                        </td>
+                        <td class="mono subtle">{{ a.ip or '-' }}</td>
+                    </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        </div>
+
+        {% if pages > 1 %}
+            <div class="pagination">
+                {% for p in range(1, pages + 1) %}
+                    {% if p <= 20 %}
+                        <a href="{{ url_for('admin_audit', page=p) }}"
+                           class="{% if p == page %}active{% endif %}">{{ p }}</a>
+                    {% endif %}
+                {% endfor %}
+            </div>
+        {% endif %}
+    {% else %}
+        <p class="subtle">아직 기록된 관리자 활동이 없습니다.</p>
+    {% endif %}
+{% endblock %}
