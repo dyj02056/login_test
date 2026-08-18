@@ -376,6 +376,18 @@ td.actions form {
     font-weight: 600;
 }
 
+input[type="number"] {
+    padding: 10px 12px;
+    border: 1px solid #d1d5db;
+    border-radius: 8px;
+    font-size: 14px;
+    outline: none;
+}
+
+input.narrow {
+    width: 90px;
+}
+
 .score-pill {
     display: inline-block;
     min-width: 34px;

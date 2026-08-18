@@ -118,4 +118,78 @@
             {% else %}의심스러운 IP가 없습니다. 정상입니다.{% endif %}
         </p>
     {% endif %}
+
+    <h2>위험 로그인 — 계정 도용 탐지</h2>
+
+    <div class="setting-row">
+        <span>
+            현재 차단 기준:
+            {% if risk_threshold > 100 %}
+                <strong class="ok-text">차단 안 함 (기록만)</strong>
+                <span class="subtle">— 섀도 모드</span>
+            {% else %}
+                <strong class="danger-text">{{ risk_threshold }}점 이상 차단</strong>
+            {% endif %}
+        </span>
+        <form method="post" action="{{ url_for('admin_risk_threshold') }}" class="search-row">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input type="number" name="threshold" min="1" max="101"
+                   value="{{ risk_threshold }}" class="narrow">
+            <button type="submit" class="inline">적용</button>
+        </form>
+    </div>
+
+    <p class="hint-block">
+        비밀번호가 맞은 로그인도 <strong>평소 패턴과 얼마나 다른지</strong> 점수를 매깁니다.
+        처음 보는 국가(+35), 처음 보는 IP(+15), 새 기기(+15),
+        <strong>불가능한 이동(+60)</strong> 등을 봅니다.
+        <br>
+        지금은 <strong>기록만 하고 아무도 차단하지 않습니다.</strong>
+        아래 목록에 정상 사용자가 섞이지 않는 것을 2주 정도 확인한 뒤
+        차단 기준을 <strong>86</strong> 정도로 낮추시길 권합니다.
+        (101 = 차단 안 함)
+    </p>
+
+    {% if risk_events %}
+        <div class="table-scroll">
+        <table>
+            <thead>
+                <tr><th>시각</th><th>아이디</th><th>점수</th><th>판정</th>
+                    <th>위치</th><th>사유</th></tr>
+            </thead>
+            <tbody>
+                {% for e in risk_events %}
+                    <tr>
+                        <td class="mono subtle">{{ e.created_at[:16].replace('T', ' ') }}</td>
+                        <td><strong>{{ e.username }}</strong>
+                            <div class="mono subtle">{{ e.ip }}</div></td>
+                        <td>
+                            <span class="score-pill
+                                {% if e.score >= 70 %}high{% elif e.score >= 40 %}mid{% else %}low{% endif %}">
+                                {{ e.score }}
+                            </span>
+                        </td>
+                        <td>
+                            {% if e.action == 'blocked' %}<span class="badge danger">차단됨</span>
+                            {% elif e.action == 'flagged' %}<span class="badge admin">주의</span>
+                            {% else %}<span class="subtle">허용</span>{% endif %}
+                        </td>
+                        <td class="subtle">
+                            {% if e.country %}{{ e.country }}{% if e.city %} · {{ e.city }}{% endif %}
+                            {% else %}-{% endif %}
+                        </td>
+                        <td>
+                            <ul class="reason-list">
+                                {% for r in e.reasons %}<li>{{ r }}</li>{% endfor %}
+                            </ul>
+                        </td>
+                    </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        </div>
+        <p class="subtle">전체 {{ risk_total }}건 중 최근 20건</p>
+    {% else %}
+        <p class="subtle">위험 신호가 있는 로그인이 아직 없습니다.</p>
+    {% endif %}
 {% endblock %}

@@ -360,6 +360,12 @@ def login():
                 message = "로그인 시도가 너무 많습니다. 15분 후 다시 시도해 주세요."
             elif reason == "inactive":
                 message = "정지된 계정입니다. 관리자에게 문의해 주세요."
+            elif reason == "risk":
+                # 비밀번호는 맞았지만 평소와 크게 다른 접속이라 차단했다.
+                message = (
+                    "평소와 다른 환경에서의 접속으로 확인되어 로그인을 차단했습니다. "
+                    "본인이 맞다면 비밀번호를 재설정하거나 관리자에게 문의해 주세요."
+                )
             else:
                 message = "아이디 또는 비밀번호가 올바르지 않습니다."
             flash(message, "error")
@@ -372,6 +378,14 @@ def login():
         session["sv"] = result.get("session_version")
         session["sv_checked_at"] = time.time()
         session.permanent = remember
+
+        # 차단 임계값에는 못 미쳤지만 평소와 다른 접속이면 본인에게 알린다.
+        if result.get("risk_action") == "flagged":
+            flash(
+                "평소와 다른 환경에서 로그인되었습니다. "
+                "본인이 아니라면 즉시 비밀번호를 변경해 주세요.",
+                "error",
+            )
 
         if session["is_admin"]:
             return redirect(url_for("admin_panel"))
@@ -783,6 +797,7 @@ def admin_threats():
             "p_only_flagged": not show_all,
         },
     )
+    risk = rpc("list_risk_events", {"p_limit": 20, "p_offset": 0, "p_min_score": 1})
     total = data.get("total", 0)
     return render_template(
         "admin_threats.html",
@@ -792,7 +807,31 @@ def admin_threats():
         page=page,
         pages=max(1, (total + per_page - 1) // per_page),
         show_all=show_all,
+        risk_events=risk.get("events", []),
+        risk_total=risk.get("total", 0),
+        risk_threshold=risk.get("threshold", 101),
     )
+
+
+@app.route("/admin/threats/threshold", methods=["POST"])
+@admin_required
+def admin_risk_threshold():
+    value = request.form.get("threshold", type=int)
+    if value is None:
+        flash("임계값을 입력해 주세요.", "error")
+        return safe_redirect("admin_threats")
+
+    result = rpc("set_risk_threshold", {"p_threshold": value})
+    if result.get("success"):
+        log_admin("risk_threshold", detail=str(value))
+        flash(
+            "위험 점수 차단을 껐습니다(기록만 함)." if value > 100
+            else f"위험 점수 {value}점 이상 로그인을 차단합니다.",
+            "success",
+        )
+    else:
+        flash(result.get("error", "설정에 실패했습니다."), "error")
+    return safe_redirect("admin_threats")
 
 
 @app.route("/admin/threats/override", methods=["POST"])

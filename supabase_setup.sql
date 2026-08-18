@@ -91,6 +91,43 @@ create index if not exists ip_reputation_score_idx
     on public.ip_reputation (score desc);
 
 
+-- 회원별 "평소 로그인 모습". 성공한 로그인만 반영해 정상 패턴을 학습하고,
+-- 이후 로그인이 이 패턴에서 얼마나 벗어나는지로 위험도를 판단합니다.
+create table if not exists public.user_login_profile (
+    user_id bigint primary key references public.users(id) on delete cascade,
+    known_ips jsonb not null default '[]'::jsonb,
+    known_countries jsonb not null default '[]'::jsonb,
+    known_agents jsonb not null default '[]'::jsonb,   -- User-Agent 해시
+    typical_hours int[] not null default '{}',         -- 주로 로그인하는 시(0~23)
+    last_lat numeric,
+    last_lon numeric,
+    last_login_at timestamptz,
+    login_count int not null default 0,
+    updated_at timestamptz not null default now()
+);
+
+
+-- 위험도가 매겨진 로그인 기록. 차단 여부와 무관하게 남겨서
+-- 임계값을 실제 데이터로 정할 수 있게 합니다(섀도 모드).
+create table if not exists public.login_risk_events (
+    id bigint generated always as identity primary key,
+    user_id bigint,
+    username text,
+    ip text,
+    country text,
+    city text,
+    score int not null,
+    reasons jsonb not null default '[]'::jsonb,
+    action text not null,          -- 'allowed' | 'flagged' | 'blocked'
+    created_at timestamptz not null default now()
+);
+
+create index if not exists login_risk_events_time_idx
+    on public.login_risk_events (created_at desc);
+create index if not exists login_risk_events_score_idx
+    on public.login_risk_events (score desc, created_at desc);
+
+
 -- 가입·재설정 남용을 막기 위한 사건 기록.
 -- 로그인 잠금과 성격이 달라(계정이 아니라 IP 남용을 봄) 별도 테이블로 둡니다.
 create table if not exists public.rate_events (
@@ -177,6 +214,14 @@ alter table public.admin_actions enable row level security;
 alter table public.rate_events enable row level security;
 alter table public.email_verifications enable row level security;
 alter table public.ip_reputation enable row level security;
+alter table public.user_login_profile enable row level security;
+alter table public.login_risk_events enable row level security;
+
+-- 위험 점수가 이 값 이상이면 로그인을 차단합니다.
+-- 기본 101 = 아무것도 차단하지 않음(섀도 모드). 실제 데이터로 오탐이 없음을
+-- 확인한 뒤 관리자 화면에서 86 등으로 낮추는 것을 전제로 합니다.
+alter table public.app_settings
+    add column if not exists risk_block_threshold int not null default 101;
 
 -- 오래된 기록을 언제 마지막으로 정리했는지 (자동 정리 주기 판단용)
 alter table public.app_settings add column if not exists last_pruned_at timestamptz;
@@ -491,6 +536,223 @@ $$;
 revoke all on function public.update_ip_reputation(text) from public, anon, authenticated;
 
 
+-- ============================================================
+-- 2-3. 로그인 위험 평가 (계정 도용 탐지)
+-- ============================================================
+
+-- 두 좌표 사이 거리(km). 하버사인 공식.
+create or replace function public.geo_distance_km(
+    lat1 numeric, lon1 numeric, lat2 numeric, lon2 numeric
+)
+returns numeric
+language sql
+immutable
+as $$
+    select 2 * 6371 * asin(sqrt(
+        power(sin(radians(lat2 - lat1) / 2), 2)
+        + cos(radians(lat1)) * cos(radians(lat2))
+        * power(sin(radians(lon2 - lon1) / 2), 2)
+    ));
+$$;
+
+
+-- 비밀번호가 맞은 로그인이 "정말 본인인지" 평가한다.
+-- 평소 패턴에서 벗어난 정도를 점수로 매기고, 프로필을 갱신한다.
+create or replace function public.assess_login_risk(
+    p_user_id bigint,
+    p_username text,
+    p_ip text,
+    p_context jsonb
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+    v_p record;
+    v_score int := 0;
+    v_reasons text[] := '{}';
+    v_ua_hash text;
+    v_country text;
+    v_lat numeric;
+    v_lon numeric;
+    v_hour int := extract(hour from now())::int;
+    v_km numeric;
+    v_hours numeric;
+    v_speed numeric;
+    v_other_fails int;
+    v_own_fails int;
+    v_threshold int;
+    v_action text;
+begin
+    v_country := nullif(p_context->>'country', '');
+    v_lat := nullif(p_context->>'lat', '')::numeric;
+    v_lon := nullif(p_context->>'lon', '')::numeric;
+    v_ua_hash := md5(coalesce(p_context->>'ua', ''));
+
+    select * into v_p from public.user_login_profile where user_id = p_user_id;
+
+    -- 첫 로그인은 비교 대상이 없으므로 점수를 매기지 않고 프로필만 만든다.
+    if v_p.user_id is null or v_p.login_count < 1 then
+        insert into public.user_login_profile
+            (user_id, known_ips, known_countries, known_agents, typical_hours,
+             last_lat, last_lon, last_login_at, login_count)
+        values (
+            p_user_id,
+            jsonb_build_array(p_ip),
+            case when v_country is null then '[]'::jsonb else jsonb_build_array(v_country) end,
+            jsonb_build_array(v_ua_hash),
+            array[v_hour],
+            v_lat, v_lon, now(), 1
+        )
+        on conflict (user_id) do update
+            set known_ips = jsonb_build_array(p_ip),
+                known_countries = case when v_country is null then '[]'::jsonb
+                                       else jsonb_build_array(v_country) end,
+                known_agents = jsonb_build_array(v_ua_hash),
+                typical_hours = array[v_hour],
+                last_lat = v_lat, last_lon = v_lon,
+                last_login_at = now(),
+                login_count = public.user_login_profile.login_count + 1,
+                updated_at = now();
+
+        return jsonb_build_object('score', 0, 'reasons', '[]'::jsonb,
+                                  'action', 'allowed', 'first_login', true);
+    end if;
+
+    -- ① 처음 보는 IP
+    if not (v_p.known_ips ? p_ip) then
+        v_score := v_score + 15;
+        v_reasons := v_reasons || '처음 보는 IP'::text;
+    end if;
+
+    -- ② 처음 보는 국가 (IP 변경보다 훨씬 강한 신호)
+    if v_country is not null and not (v_p.known_countries ? v_country) then
+        v_score := v_score + 35;
+        v_reasons := v_reasons || format('처음 보는 국가(%s)', v_country);
+    end if;
+
+    -- ③ 처음 보는 기기
+    if not (v_p.known_agents ? v_ua_hash) then
+        v_score := v_score + 15;
+        v_reasons := v_reasons || '처음 보는 기기'::text;
+    end if;
+
+    -- ④ 평소와 다른 시간대 (표본이 쌓인 뒤에만 판단)
+    if v_p.login_count >= 5 and not (v_hour = any(v_p.typical_hours)) then
+        v_score := v_score + 10;
+        v_reasons := v_reasons || format('평소와 다른 시간대(%s시)', v_hour);
+    end if;
+
+    -- ⑤ 불가능한 이동 — 가장 강한 신호
+    if v_lat is not null and v_p.last_lat is not null and v_p.last_login_at is not null then
+        v_km := public.geo_distance_km(v_p.last_lat, v_p.last_lon, v_lat, v_lon);
+        v_hours := greatest(
+            extract(epoch from (now() - v_p.last_login_at)) / 3600.0,
+            0.01
+        );
+        v_speed := v_km / v_hours;
+        -- 여객기 순항속도(약 900km/h)를 크게 넘으면 물리적으로 불가능하다.
+        if v_km > 500 and v_speed > 1000 then
+            v_score := v_score + 60;
+            v_reasons := v_reasons || format(
+                '불가능한 이동: %s분 만에 %skm (필요속도 %skm/h)',
+                round(v_hours * 60), round(v_km), round(v_speed)
+            );
+        end if;
+    end if;
+
+    -- ⑥ 이 IP 가 최근 다른 계정을 공격했다면 성공 로그인도 의심스럽다
+    select count(*) into v_other_fails
+      from public.login_attempts
+     where ip = p_ip and not success
+       and username <> p_username
+       and attempted_at > now() - interval '1 hour';
+    if v_other_fails >= 5 then
+        v_score := v_score + 40;
+        v_reasons := v_reasons || format('같은 IP 가 다른 계정 %s회 실패시킴', v_other_fails);
+    end if;
+
+    -- ⑦ 이 계정이 직전에 집중적으로 시도당했다면 대입 끝에 뚫렸을 수 있다
+    select count(*) into v_own_fails
+      from public.login_attempts
+     where username = p_username and not success
+       and attempted_at > now() - interval '1 hour';
+    if v_own_fails >= 10 then
+        v_score := v_score + 25;
+        v_reasons := v_reasons || format('직전 1시간 이 계정 실패 %s회', v_own_fails);
+    end if;
+
+    v_score := least(v_score, 100);
+
+    select risk_block_threshold into v_threshold from public.app_settings where id = true;
+    if v_score >= coalesce(v_threshold, 101) then
+        v_action := 'blocked';
+    elsif v_score >= 61 then
+        v_action := 'flagged';
+    else
+        v_action := 'allowed';
+    end if;
+
+    -- 정상으로 판정된 로그인만 학습한다.
+    -- 의심스러운 로그인(flagged)까지 학습하면, 공격자가 한 번 통과하는 순간
+    -- 그 위치·기기가 "평소 패턴"이 되어 이후 탐지가 무력화된다.
+    -- 대가로 실제 해외 출장자는 매번 주의로 표시되는데, 이는 본인 확인 수단
+    -- (이메일 코드)이 붙는 다음 단계에서 "본인 맞음"을 눌러 해소할 부분이다.
+    if v_action = 'allowed' then
+        update public.user_login_profile
+           set known_ips = case when known_ips ? p_ip then known_ips
+                                else (
+                                    -- 최근 10개만 유지
+                                    select jsonb_agg(v) from (
+                                        select v from jsonb_array_elements(
+                                            jsonb_build_array(p_ip) || known_ips
+                                        ) v limit 10
+                                    ) t
+                                ) end,
+               known_countries = case
+                    when v_country is null or known_countries ? v_country then known_countries
+                    else known_countries || jsonb_build_array(v_country) end,
+               known_agents = case when known_agents ? v_ua_hash then known_agents
+                                   else (
+                                       select jsonb_agg(v) from (
+                                           select v from jsonb_array_elements(
+                                               jsonb_build_array(v_ua_hash) || known_agents
+                                           ) v limit 5
+                                       ) t
+                                   ) end,
+               typical_hours = case when v_hour = any(typical_hours) then typical_hours
+                                    else typical_hours || v_hour end,
+               last_lat = coalesce(v_lat, last_lat),
+               last_lon = coalesce(v_lon, last_lon),
+               last_login_at = now(),
+               login_count = login_count + 1,
+               updated_at = now()
+         where user_id = p_user_id;
+    end if;
+
+    if v_score > 0 then
+        insert into public.login_risk_events
+            (user_id, username, ip, country, city, score, reasons, action)
+        values (
+            p_user_id, p_username, p_ip, v_country,
+            nullif(p_context->>'city', ''), v_score, to_jsonb(v_reasons), v_action
+        );
+    end if;
+
+    return jsonb_build_object(
+        'score', v_score,
+        'reasons', to_jsonb(v_reasons),
+        'action', v_action
+    );
+end;
+$$;
+
+revoke all on function public.assess_login_risk(bigint, text, text, jsonb)
+    from public, anon, authenticated;
+
+
 -- 이전 버전의 함수 시그니처 제거 (인자가 바뀌었으므로)
 drop function if exists public.signup_user(text, text);
 drop function if exists public.login_user(text, text);
@@ -602,6 +864,7 @@ declare
     v_user record;
     v_ok boolean := false;
     v_existed boolean;
+    v_risk jsonb;
 begin
     if not public.check_secret(p_secret) then
         return jsonb_build_object('success', false, 'reason', 'secret');
@@ -645,12 +908,29 @@ begin
         return jsonb_build_object('success', false, 'reason', 'inactive');
     end if;
 
+    -- 비밀번호는 맞았다. 이제 "정말 본인인가"를 평소 패턴과 비교해 판단한다.
+    v_risk := public.assess_login_risk(
+        v_user.id, v_user.username, p_ip, p_context
+    );
+
+    if v_risk->>'action' = 'blocked' then
+        return jsonb_build_object(
+            'success', false,
+            'reason', 'risk',
+            'risk_score', (v_risk->>'score')::int,
+            'risk_reasons', v_risk->'reasons'
+        );
+    end if;
+
     return jsonb_build_object(
         'success', true,
         'id', v_user.id,
         'username', v_user.username,
         'is_admin', v_user.is_admin,
-        'session_version', v_user.session_version
+        'session_version', v_user.session_version,
+        'risk_score', (v_risk->>'score')::int,
+        'risk_action', v_risk->>'action',
+        'risk_reasons', v_risk->'reasons'
     );
 end;
 $$;
@@ -1354,6 +1634,67 @@ end;
 $$;
 
 
+-- 위험도가 매겨진 로그인 목록 (관리자 화면)
+create or replace function public.list_risk_events(
+    p_secret text,
+    p_limit int default 30,
+    p_offset int default 0,
+    p_min_score int default 1
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+    v_rows jsonb;
+    v_total int;
+begin
+    if not public.check_secret(p_secret) then
+        return jsonb_build_object('total', 0, 'events', '[]'::jsonb);
+    end if;
+
+    select count(*) into v_total
+      from public.login_risk_events where score >= p_min_score;
+
+    select coalesce(jsonb_agg(t order by t.created_at desc), '[]'::jsonb) into v_rows
+      from (
+        select id, username, ip, country, city, score, reasons, action, created_at
+          from public.login_risk_events
+         where score >= p_min_score
+         order by created_at desc
+         limit p_limit offset p_offset
+      ) t;
+
+    return jsonb_build_object(
+        'total', v_total,
+        'events', v_rows,
+        'threshold', (select risk_block_threshold from public.app_settings where id = true)
+    );
+end;
+$$;
+
+
+-- 차단 임계값 조정. 101 이면 아무것도 차단하지 않는 섀도 모드.
+create or replace function public.set_risk_threshold(p_secret text, p_threshold int)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+    if not public.check_secret(p_secret) then
+        return jsonb_build_object('success', false);
+    end if;
+    if p_threshold < 1 or p_threshold > 101 then
+        return jsonb_build_object('success', false, 'error', '1~101 사이여야 합니다.');
+    end if;
+    update public.app_settings set risk_block_threshold = p_threshold where id = true;
+    return jsonb_build_object('success', true, 'threshold', p_threshold);
+end;
+$$;
+
+
 -- 자동 차단 즉시 해제 (점수는 남기되 차단만 품)
 create or replace function public.unblock_ip(p_secret text, p_ip text)
 returns jsonb
@@ -1508,6 +1849,10 @@ begin
     delete from public.rate_events
      where created_at < now() - interval '1 day';
 
+    -- 위험 로그인 기록은 감사 로그와 같은 기준(1년)으로 보관합니다.
+    delete from public.login_risk_events
+     where created_at < now() - interval '365 days';
+
     -- 오래 조용한 IP 는 평판을 지웁니다. 관리자가 직접 지정한 항목은 남깁니다.
     delete from public.ip_reputation
      where manual_override is null
@@ -1600,6 +1945,8 @@ grant execute on function public.clear_login_attempts(text, text) to anon, authe
 grant execute on function public.list_ip_reputation(text, int, int, boolean) to anon, authenticated;
 grant execute on function public.set_ip_override(text, text, text) to anon, authenticated;
 grant execute on function public.unblock_ip(text, text) to anon, authenticated;
+grant execute on function public.list_risk_events(text, int, int, int) to anon, authenticated;
+grant execute on function public.set_risk_threshold(text, int) to anon, authenticated;
 grant execute on function public.get_signup_stats(text, int) to anon, authenticated;
 grant execute on function public.log_admin_action(text, text, text, bigint, text, text, text) to anon, authenticated;
 grant execute on function public.get_admin_actions(text, int, int) to anon, authenticated;
