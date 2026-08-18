@@ -320,6 +320,13 @@ def signup():
             error = "비밀번호는 6자 이상이어야 합니다."
         elif password != confirm:
             error = "비밀번호가 일치하지 않습니다."
+        elif ADMIN_USERNAME and secure_equals(username, ADMIN_USERNAME):
+            # 비상용 관리자 아이디로는 가입할 수 없습니다. 가입되더라도
+            # 로그인 시 관리자 분기가 먼저 가로채서 본인 계정에 영영
+            # 들어갈 수 없기 때문입니다.
+            # 문구를 중복 아이디와 똑같이 맞춰서, 이 아이디가 특별하다는
+            # 사실 자체를 밖에서 알아낼 수 없게 합니다.
+            error = "이미 사용 중인 아이디입니다."
 
         if error is None:
             result = rpc(
