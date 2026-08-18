@@ -489,3 +489,59 @@ input.narrow {
     color: #6366f1;
     margin-bottom: 8px;
 }
+
+.badge.warn { background: #fef3c7; color: #b45309; }
+
+.briefing {
+    background: #f9fafb;
+    border-radius: 10px;
+    padding: 16px;
+    margin: 12px 0;
+}
+
+.briefing-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-bottom: 8px;
+}
+
+.briefing-head strong {
+    font-size: 14px;
+    color: #1f2937;
+}
+
+.briefing-body {
+    margin: 0;
+    font-size: 13px;
+    line-height: 1.7;
+    color: #374151;
+    white-space: pre-wrap;
+}
+
+.briefing-label {
+    margin: 12px 0 4px;
+    font-size: 12px;
+    font-weight: 600;
+    color: #6b7280;
+}
+
+.briefing-meta {
+    margin: 12px 0 0;
+}
+
+details.digest {
+    margin-top: 12px;
+}
+
+details.digest summary {
+    cursor: pointer;
+    font-size: 12px;
+    color: #4338ca;
+    font-weight: 600;
+}
+
+details.digest[open] summary {
+    margin-bottom: 8px;
+}

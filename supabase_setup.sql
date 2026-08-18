@@ -223,6 +223,25 @@ update public.app_settings
 
 alter table public.app_settings alter column rpc_secret set not null;
 
+-- LLM 이 만든 일일 보안 브리핑 보관함.
+-- 요약문뿐 아니라 요약의 근거가 된 집계 데이터(digest)도 함께 남깁니다.
+-- 나중에 "왜 그렇게 판단했는지"를 사람이 되짚어볼 수 있어야 하기 때문입니다.
+create table if not exists public.security_briefings (
+    id bigint generated always as identity primary key,
+    period_hours int not null default 24,
+    risk_level text not null default 'normal',    -- normal | attention | critical
+    headline text not null default '',
+    summary text not null default '',
+    recommendations jsonb not null default '[]'::jsonb,
+    digest jsonb not null default '{}'::jsonb,    -- LLM 에 넘긴 집계 원본
+    model text not null default '',
+    created_at timestamptz not null default now()
+);
+
+create index if not exists security_briefings_time_idx
+    on public.security_briefings (created_at desc);
+
+
 -- 모든 테이블 RLS 활성화 + 정책 없음 => anon 키로 직접 접근 불가.
 -- 오직 아래 security definer 함수들을 통해서만 데이터에 접근합니다.
 alter table public.users enable row level security;
@@ -236,6 +255,7 @@ alter table public.ip_reputation enable row level security;
 alter table public.user_login_profile enable row level security;
 alter table public.login_risk_events enable row level security;
 alter table public.login_challenges enable row level security;
+alter table public.security_briefings enable row level security;
 
 -- 위험 점수가 이 값 이상이면 로그인을 차단합니다.
 -- 기본 101 = 아무것도 차단하지 않음(섀도 모드). 실제 데이터로 오탐이 없음을
@@ -2117,6 +2137,10 @@ begin
        and last_seen < now() - interval '30 days'
        and (blocked_until is null or blocked_until < now());
 
+    -- 보안 브리핑은 90일치만 남깁니다.
+    delete from public.security_briefings
+     where created_at < now() - interval '90 days';
+
     -- 감사 로그는 더 오래 (1년) 보관합니다.
     delete from public.admin_actions
      where created_at < now() - interval '365 days';
@@ -2173,6 +2197,221 @@ $$;
 
 
 -- ============================================================
+-- 6-3. LLM 일일 보안 브리핑
+--
+-- get_security_digest 는 지난 N시간의 로그를 "집계된 숫자"로만 요약합니다.
+-- 이 결과가 그대로 Claude 에게 전달되므로, 공격자가 값을 정할 수 있는
+-- 문자열(아이디, User-Agent)은 절대 넣지 않습니다.
+--   * 아이디      -> 계정1, 계정2 같은 익명 라벨로 치환
+--   * 탐지 근거   -> 우리가 SQL 에 직접 써 넣은 고정 문구만 사용
+--   * User-Agent  -> 아예 제외
+-- 로그에 지시문을 심어 LLM 을 조종하는 프롬프트 인젝션을 원천 차단합니다.
+-- ============================================================
+
+create or replace function public.get_security_digest(
+    p_secret text,
+    p_hours int default 24
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+    v_since timestamptz;
+    v_totals jsonb;
+    v_top_ips jsonb;
+    v_blocked jsonb;
+    v_risk jsonb;
+    v_risk_top jsonb;
+    v_signups int;
+begin
+    if not public.check_secret(p_secret) then
+        return jsonb_build_object('ok', false);
+    end if;
+
+    -- 최소 1시간, 최대 7일. 밖에서 이상한 값이 와도 쿼리가 폭주하지 않게 합니다.
+    p_hours := greatest(1, least(coalesce(p_hours, 24), 168));
+    v_since := now() - (p_hours || ' hours')::interval;
+
+    select jsonb_build_object(
+        'attempts', count(*),
+        'success', count(*) filter (where a.success),
+        'failed', count(*) filter (where not a.success),
+        'distinct_ips', count(distinct nullif(a.ip, '')),
+        'distinct_accounts', count(distinct a.username),
+        'attempts_on_unknown_accounts',
+            count(*) filter (where a.user_existed is false)
+    ) into v_totals
+      from public.login_attempts a
+     where a.attempted_at > v_since;
+
+    -- 실패가 많은 IP 상위 10개.
+    -- distinct_accounts 가 크면 "아이디를 바꿔가며 찌르는" 스프레이 공격 신호입니다.
+    select coalesce(jsonb_agg(t order by t.failed desc), '[]'::jsonb) into v_top_ips
+      from (
+        select a.ip,
+               count(*) filter (where not a.success) as failed,
+               count(*) filter (where a.success) as succeeded,
+               count(distinct a.username) as distinct_accounts,
+               max(a.country) as country,
+               coalesce(r.score, 0) as ip_score,
+               (r.blocked_until is not null and r.blocked_until > now())
+                   as currently_blocked
+          from public.login_attempts a
+          left join public.ip_reputation r on r.ip = a.ip
+         where a.attempted_at > v_since
+           and coalesce(a.ip, '') <> ''
+         group by a.ip, r.score, r.blocked_until
+        having count(*) filter (where not a.success) > 0
+         order by failed desc
+         limit 10
+      ) t;
+
+    -- 이 기간에 활동했고 지금 차단 상태인 IP
+    select coalesce(jsonb_agg(t order by t.score desc), '[]'::jsonb) into v_blocked
+      from (
+        select r.ip, r.score, r.reasons, r.manual_override,
+               (r.blocked_until is not null and r.blocked_until > now()) as active
+          from public.ip_reputation r
+         where r.last_seen > v_since
+           and (r.blocked_until is not null or r.manual_override = 'block')
+         order by r.score desc
+         limit 10
+      ) t;
+
+    select jsonb_build_object(
+        'allowed',   count(*) filter (where e.action = 'allowed'),
+        'flagged',   count(*) filter (where e.action = 'flagged'),
+        'challenge', count(*) filter (where e.action = 'challenge'),
+        'confirmed', count(*) filter (where e.action = 'confirmed'),
+        'blocked',   count(*) filter (where e.action = 'blocked')
+    ) into v_risk
+      from public.login_risk_events e
+     where e.created_at > v_since;
+
+    -- 눈에 띄는 위험 로그인. 아이디는 익명 라벨로 바꿔서 내보냅니다.
+    select coalesce(jsonb_agg(t order by t.score desc), '[]'::jsonb) into v_risk_top
+      from (
+        select '계정'::text
+                 || (dense_rank() over (order by e.username))::text as account,
+               e.score, e.action, e.country, e.ip, e.reasons
+          from public.login_risk_events e
+         where e.created_at > v_since
+           and e.score >= 40
+         order by e.score desc
+         limit 10
+      ) t;
+
+    select count(*) into v_signups
+      from public.users where created_at > v_since;
+
+    return jsonb_build_object(
+        'period_hours', p_hours,
+        'totals', v_totals,
+        'new_signups', v_signups,
+        'top_failing_ips', v_top_ips,
+        'blocked_ips', v_blocked,
+        'risk_logins', v_risk,
+        'notable_risk_logins', v_risk_top,
+        'admin_actions', (select count(*) from public.admin_actions
+                           where created_at > v_since),
+        'settings', (select jsonb_build_object(
+                        'signup_enabled', signup_enabled,
+                        'risk_block_threshold', risk_block_threshold,
+                        'risk_challenge_threshold', risk_challenge_threshold)
+                       from public.app_settings where id = true)
+    );
+end;
+$$;
+
+
+-- 생성된 브리핑 저장
+create or replace function public.save_briefing(
+    p_secret text,
+    p_period_hours int,
+    p_risk_level text,
+    p_headline text,
+    p_summary text,
+    p_recommendations jsonb,
+    p_digest jsonb,
+    p_model text
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+    v_id bigint;
+begin
+    if not public.check_secret(p_secret) then
+        return jsonb_build_object('success', false);
+    end if;
+
+    -- LLM 이 만든 값이므로 그대로 믿지 않고 여기서 한 번 더 좁힙니다.
+    if p_risk_level is null
+       or p_risk_level not in ('normal', 'attention', 'critical') then
+        p_risk_level := 'normal';
+    end if;
+
+    insert into public.security_briefings
+        (period_hours, risk_level, headline, summary,
+         recommendations, digest, model)
+    values (coalesce(p_period_hours, 24),
+            p_risk_level,
+            left(coalesce(p_headline, ''), 300),
+            left(coalesce(p_summary, ''), 8000),
+            coalesce(p_recommendations, '[]'::jsonb),
+            coalesce(p_digest, '{}'::jsonb),
+            left(coalesce(p_model, ''), 100))
+    returning id into v_id;
+
+    return jsonb_build_object('success', true, 'id', v_id);
+end;
+$$;
+
+
+-- 브리핑 목록 (최신순)
+create or replace function public.get_briefings(
+    p_secret text,
+    p_limit int default 10,
+    p_offset int default 0
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+    v_items jsonb;
+    v_total int;
+begin
+    if not public.check_secret(p_secret) then
+        return jsonb_build_object('items', '[]'::jsonb, 'total', 0);
+    end if;
+
+    p_limit := greatest(1, least(coalesce(p_limit, 10), 50));
+    p_offset := greatest(0, coalesce(p_offset, 0));
+
+    select count(*) into v_total from public.security_briefings;
+
+    select coalesce(jsonb_agg(t order by t.created_at desc), '[]'::jsonb)
+      into v_items
+      from (
+        select b.id, b.period_hours, b.risk_level, b.headline, b.summary,
+               b.recommendations, b.digest, b.model, b.created_at
+          from public.security_briefings b
+         order by b.created_at desc
+         limit p_limit offset p_offset
+      ) t;
+
+    return jsonb_build_object('items', v_items, 'total', v_total);
+end;
+$$;
+
+
+-- ============================================================
 -- 7. 권한 부여 (anon = publishable 키로 호출 가능한 함수 목록)
 --    모든 함수가 p_secret 을 요구하므로 실제 실행은 서버만 가능합니다.
 -- ============================================================
@@ -2212,6 +2451,9 @@ grant execute on function public.get_signup_stats(text, int) to anon, authentica
 grant execute on function public.log_admin_action(text, text, text, bigint, text, text, text) to anon, authenticated;
 grant execute on function public.get_admin_actions(text, int, int) to anon, authenticated;
 grant execute on function public.prune_old_records(text, int, boolean) to anon, authenticated;
+grant execute on function public.get_security_digest(text, int) to anon, authenticated;
+grant execute on function public.save_briefing(text, int, text, text, text, jsonb, jsonb, text) to anon, authenticated;
+grant execute on function public.get_briefings(text, int, int) to anon, authenticated;
 
 
 -- ============================================================
