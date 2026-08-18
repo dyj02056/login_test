@@ -1,0 +1,121 @@
+{% extends "base.html" %}
+{% block title %}위협 탐지{% endblock %}
+{% block card_class %}wide{% endblock %}
+{% block content %}
+    <h1>위협 탐지 — IP 평판</h1>
+    <p class="subtle">관찰 중 {{ total }}개 · 현재 차단 {{ blocked }}개</p>
+
+    <p class="hint-block">
+        로그인 실패 패턴을 보고 IP 위험 점수를 자동으로 매깁니다.
+        계정 단위 잠금과 달리 <strong>아이디를 바꿔가며 시도하는 공격</strong>도 막습니다.
+        점수 50 이상 15분, 70 이상 1시간, 90 이상 6시간 차단됩니다.
+        <br>
+        회사·학교처럼 여러 사람이 한 IP를 쓰는 곳이 잘못 걸렸다면
+        <strong>항상 허용</strong>으로 지정하세요. 이후 점수와 무관하게 차단되지 않습니다.
+    </p>
+
+    <div class="search-row">
+        {% if show_all %}
+            <a class="button inline gray" href="{{ url_for('admin_threats') }}">의심 IP만 보기</a>
+        {% else %}
+            <a class="button inline gray" href="{{ url_for('admin_threats', all=1) }}">전체 IP 보기</a>
+        {% endif %}
+    </div>
+
+    {% if items %}
+        <div class="table-scroll">
+        <table>
+            <thead>
+                <tr>
+                    <th>IP</th><th>점수</th><th>상태</th>
+                    <th>탐지 근거</th><th>마지막 활동</th><th>작업</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for it in items %}
+                    <tr>
+                        <td class="mono"><strong>{{ it.ip }}</strong></td>
+                        <td>
+                            <span class="score-pill
+                                {% if it.score >= 70 %}high{% elif it.score >= 40 %}mid{% else %}low{% endif %}">
+                                {{ it.score }}
+                            </span>
+                        </td>
+                        <td>
+                            {% if it.manual_override == 'allow' %}
+                                <span class="badge ok">항상 허용</span>
+                            {% elif it.manual_override == 'block' %}
+                                <span class="badge danger">영구 차단</span>
+                            {% elif it.is_blocked %}
+                                <span class="badge danger">차단 중</span>
+                                <div class="mono subtle">~ {{ it.blocked_until[:16].replace('T', ' ') }}</div>
+                            {% else %}
+                                <span class="subtle">관찰</span>
+                            {% endif %}
+                        </td>
+                        <td>
+                            {% if it.reasons %}
+                                <ul class="reason-list">
+                                    {% for r in it.reasons %}<li>{{ r }}</li>{% endfor %}
+                                </ul>
+                            {% else %}
+                                <span class="subtle">-</span>
+                            {% endif %}
+                        </td>
+                        <td class="mono subtle">{{ it.last_seen[:16].replace('T', ' ') }}</td>
+                        <td class="actions">
+                            {% if it.is_blocked or it.manual_override == 'block' %}
+                                <form method="post" action="{{ url_for('admin_unblock_ip') }}">
+                                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                    <input type="hidden" name="ip" value="{{ it.ip }}">
+                                    <button type="submit" class="mini">차단 해제</button>
+                                </form>
+                            {% endif %}
+                            {% if it.manual_override != 'allow' %}
+                                <form method="post" action="{{ url_for('admin_ip_override') }}">
+                                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                    <input type="hidden" name="ip" value="{{ it.ip }}">
+                                    <input type="hidden" name="override" value="allow">
+                                    <button type="submit" class="mini">항상 허용</button>
+                                </form>
+                            {% endif %}
+                            {% if it.manual_override != 'block' %}
+                                <form method="post" action="{{ url_for('admin_ip_override') }}"
+                                      data-confirm="{{ it.ip }} 를 영구 차단할까요?">
+                                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                    <input type="hidden" name="ip" value="{{ it.ip }}">
+                                    <input type="hidden" name="override" value="block">
+                                    <button type="submit" class="mini danger">영구 차단</button>
+                                </form>
+                            {% endif %}
+                            {% if it.manual_override %}
+                                <form method="post" action="{{ url_for('admin_ip_override') }}">
+                                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                    <input type="hidden" name="ip" value="{{ it.ip }}">
+                                    <button type="submit" class="mini">자동 판정</button>
+                                </form>
+                            {% endif %}
+                        </td>
+                    </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        </div>
+
+        {% if pages > 1 %}
+            <div class="pagination">
+                {% for p in range(1, pages + 1) %}
+                    {% if p <= 20 %}
+                        <a href="{{ url_for('admin_threats', page=p, all=1 if show_all else None) }}"
+                           class="{% if p == page %}active{% endif %}">{{ p }}</a>
+                    {% endif %}
+                {% endfor %}
+            </div>
+        {% endif %}
+    {% else %}
+        <p class="subtle">
+            {% if show_all %}기록된 IP가 없습니다.
+            {% else %}의심스러운 IP가 없습니다. 정상입니다.{% endif %}
+        </p>
+    {% endif %}
+{% endblock %}

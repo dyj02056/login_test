@@ -24,6 +24,36 @@
         </div>
     </div>
 
+    <h2>위협 탐지</h2>
+    {% if threat_items %}
+        <p class="subtle">현재 차단 중인 IP {{ threat_blocked }}개 · 최근 탐지 순</p>
+        <table>
+            <thead><tr><th>IP</th><th>점수</th><th>근거</th><th>상태</th></tr></thead>
+            <tbody>
+                {% for it in threat_items %}
+                    <tr>
+                        <td class="mono">{{ it.ip }}</td>
+                        <td>
+                            <span class="score-pill
+                                {% if it.score >= 70 %}high{% elif it.score >= 40 %}mid{% else %}low{% endif %}">
+                                {{ it.score }}
+                            </span>
+                        </td>
+                        <td class="subtle">{{ (it.reasons or ['-'])|join(', ') }}</td>
+                        <td>
+                            {% if it.manual_override == 'allow' %}<span class="badge ok">허용</span>
+                            {% elif it.is_blocked or it.manual_override == 'block' %}<span class="badge danger">차단</span>
+                            {% else %}<span class="subtle">관찰</span>{% endif %}
+                        </td>
+                    </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        <p class="switch"><a href="{{ url_for('admin_threats') }}">전체 보기</a></p>
+    {% else %}
+        <p class="subtle">탐지된 위협이 없습니다.</p>
+    {% endif %}
+
     <h2>회원가입 설정</h2>
     <div class="setting-row">
         <span>

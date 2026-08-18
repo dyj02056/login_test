@@ -19,14 +19,30 @@
         <div class="table-scroll">
         <table>
             <thead>
-                <tr><th>시각</th><th>아이디</th><th>IP</th><th>결과</th></tr>
+                <tr>
+                    <th>시각</th><th>아이디</th><th>IP</th><th>위치</th>
+                    <th>클라이언트</th><th>결과</th>
+                </tr>
             </thead>
             <tbody>
                 {% for a in attempts %}
                     <tr>
                         <td class="mono subtle">{{ a.attempted_at[:19].replace('T', ' ') }}</td>
-                        <td>{{ a.username }}</td>
+                        <td>
+                            {{ a.username }}
+                            {% if a.user_existed is false %}
+                                <span class="badge danger" title="존재하지 않는 계정으로 시도">미존재</span>
+                            {% endif %}
+                        </td>
                         <td class="mono subtle">{{ a.ip or '-' }}</td>
+                        <td class="subtle">
+                            {% if a.country %}
+                                {{ a.country }}{% if a.city %} · {{ a.city }}{% endif %}
+                            {% else %}-{% endif %}
+                        </td>
+                        <td class="subtle client-cell" title="{{ a.user_agent or '' }}">
+                            {{ (a.user_agent or '-')[:38] }}
+                        </td>
                         <td>
                             {% if a.success %}
                                 <span class="badge ok">성공</span>

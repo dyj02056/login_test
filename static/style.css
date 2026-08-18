@@ -376,6 +376,36 @@ td.actions form {
     font-weight: 600;
 }
 
+.score-pill {
+    display: inline-block;
+    min-width: 34px;
+    padding: 3px 8px;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 700;
+    text-align: center;
+}
+
+.score-pill.low  { background: #f3f4f6; color: #4b5563; }
+.score-pill.mid  { background: #fef3c7; color: #b45309; }
+.score-pill.high { background: #fee2e2; color: #b91c1c; }
+
+.reason-list {
+    margin: 0;
+    padding-left: 16px;
+    font-size: 12px;
+    color: #4b5563;
+    line-height: 1.6;
+}
+
+.client-cell {
+    max-width: 240px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 12px;
+}
+
 .badge.ok { background: #dcfce7; color: #15803d; }
 .badge.danger { background: #fee2e2; color: #b91c1c; }
 .badge.admin { background: #ede9fe; color: #6d28d9; }

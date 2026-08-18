@@ -4,7 +4,7 @@ import time
 from datetime import timedelta
 from functools import wraps
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import requests
 from dotenv import load_dotenv
@@ -106,6 +106,21 @@ def client_ip():
     if forwarded:
         return forwarded.split(",")[0].strip()
     return request.remote_addr or ""
+
+
+def request_context():
+    """침입 탐지에 쓸 요청 부가 정보.
+
+    국가·도시·좌표는 Vercel 이 엣지에서 헤더로 넣어 주므로 외부 GeoIP 조회가
+    필요 없습니다. 로컬이나 다른 호스팅에서는 값이 비어 있게 됩니다.
+    """
+    return {
+        "ua": request.headers.get("User-Agent", "")[:300],
+        "country": request.headers.get("x-vercel-ip-country", ""),
+        "city": unquote(request.headers.get("x-vercel-ip-city", "")),
+        "lat": request.headers.get("x-vercel-ip-latitude", ""),
+        "lon": request.headers.get("x-vercel-ip-longitude", ""),
+    }
 
 
 def safe_redirect(fallback_endpoint):
@@ -299,6 +314,7 @@ def login():
         password = request.form.get("password", "")
         remember = request.form.get("remember") == "on"
         ip = client_ip()
+        ctx = request_context()
 
         # 아이디 종류와 무관하게 잠금을 가장 먼저 판정합니다.
         # 환경변수 관리자도 이 검사를 통과해야만 다음으로 넘어갑니다.
@@ -311,7 +327,12 @@ def login():
             success = hmac.compare_digest(password, ADMIN_PASSWORD)
             rpc(
                 "record_login_attempt",
-                {"p_username": username, "p_ip": ip, "p_success": success},
+                {
+                    "p_username": username,
+                    "p_ip": ip,
+                    "p_success": success,
+                    "p_context": ctx,
+                },
             )
             if not success:
                 flash("아이디 또는 비밀번호가 올바르지 않습니다.", "error")
@@ -325,7 +346,12 @@ def login():
 
         result = rpc(
             "login_user",
-            {"p_username": username, "p_password": password, "p_ip": ip},
+            {
+                "p_username": username,
+                "p_password": password,
+                "p_ip": ip,
+                "p_context": ctx,
+            },
         )
 
         if not result.get("success"):
@@ -581,11 +607,15 @@ def admin_panel():
         pass
 
     stats = rpc("get_signup_stats", {"p_days": 14})
+    threats = rpc("list_ip_reputation", {"p_limit": 5, "p_offset": 0,
+                                         "p_only_flagged": True})
     return render_template(
         "admin.html",
         signup_enabled=is_signup_enabled(),
         stats=stats,
         pending_resets=rpc("list_pending_resets"),
+        threat_items=threats.get("items", []),
+        threat_blocked=threats.get("blocked", 0),
     )
 
 
@@ -737,6 +767,61 @@ def admin_logs():
         page=page,
         pages=max(1, (total + per_page - 1) // per_page),
     )
+
+
+@app.route("/admin/threats")
+@admin_required
+def admin_threats():
+    page = max(1, request.args.get("page", 1, type=int))
+    show_all = request.args.get("all") == "1"
+    per_page = 50
+    data = rpc(
+        "list_ip_reputation",
+        {
+            "p_limit": per_page,
+            "p_offset": (page - 1) * per_page,
+            "p_only_flagged": not show_all,
+        },
+    )
+    total = data.get("total", 0)
+    return render_template(
+        "admin_threats.html",
+        items=data.get("items", []),
+        total=total,
+        blocked=data.get("blocked", 0),
+        page=page,
+        pages=max(1, (total + per_page - 1) // per_page),
+        show_all=show_all,
+    )
+
+
+@app.route("/admin/threats/override", methods=["POST"])
+@admin_required
+def admin_ip_override():
+    ip = request.form.get("ip", "").strip()
+    override = request.form.get("override") or None
+    if ip:
+        rpc("set_ip_override", {"p_ip": ip, "p_override": override})
+        log_admin("ip_override", target_username=ip, detail=override or "auto")
+        flash(
+            {
+                "allow": f"{ip} 를 항상 허용으로 지정했습니다.",
+                "block": f"{ip} 를 영구 차단했습니다.",
+            }.get(override, f"{ip} 를 자동 판정으로 되돌렸습니다."),
+            "success",
+        )
+    return safe_redirect("admin_threats")
+
+
+@app.route("/admin/threats/unblock", methods=["POST"])
+@admin_required
+def admin_unblock_ip():
+    ip = request.form.get("ip", "").strip()
+    if ip:
+        rpc("unblock_ip", {"p_ip": ip})
+        log_admin("ip_unblock", target_username=ip)
+        flash(f"{ip} 의 차단을 해제했습니다.", "success")
+    return safe_redirect("admin_threats")
 
 
 @app.route("/admin/unlock", methods=["POST"])

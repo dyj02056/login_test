@@ -39,6 +39,16 @@ create table if not exists public.login_attempts (
     attempted_at timestamptz not null default now()
 );
 
+-- 침입 탐지를 위한 부가 정보. 규칙을 만들기 전에 먼저 쌓아 두어야
+-- 임계값을 추측이 아니라 실제 데이터로 정할 수 있습니다.
+alter table public.login_attempts add column if not exists user_agent text;
+alter table public.login_attempts add column if not exists country text;
+alter table public.login_attempts add column if not exists city text;
+alter table public.login_attempts add column if not exists lat numeric;
+alter table public.login_attempts add column if not exists lon numeric;
+-- 존재하지 않는 아이디만 시도하는 정찰(reconnaissance) 탐지에 씁니다.
+alter table public.login_attempts add column if not exists user_existed boolean;
+
 create index if not exists login_attempts_username_time_idx
     on public.login_attempts (username, attempted_at desc);
 create index if not exists login_attempts_time_idx
@@ -60,6 +70,26 @@ create table if not exists public.password_resets (
 );
 
 create index if not exists password_resets_user_idx on public.password_resets (user_id);
+
+-- IP 평판. 로그인 잠금(15분)과 달리 누적 관리되며, 아이디를 바꿔가며
+-- 시도하는 공격을 IP 단위로 승격해 차단합니다.
+create table if not exists public.ip_reputation (
+    ip text primary key,
+    score int not null default 0,              -- 0~100, 높을수록 위험
+    blocked_until timestamptz,                 -- 이 시각까지 전면 차단
+    manual_override text,                      -- 'allow' | 'block' | null (관리자 판단 우선)
+    reasons jsonb not null default '[]'::jsonb,-- 점수가 오른 근거 누적
+    first_seen timestamptz not null default now(),
+    last_seen timestamptz not null default now(),
+    constraint ip_reputation_override_check
+        check (manual_override is null or manual_override in ('allow', 'block'))
+);
+
+create index if not exists ip_reputation_blocked_idx
+    on public.ip_reputation (blocked_until desc) where blocked_until is not null;
+create index if not exists ip_reputation_score_idx
+    on public.ip_reputation (score desc);
+
 
 -- 가입·재설정 남용을 막기 위한 사건 기록.
 -- 로그인 잠금과 성격이 달라(계정이 아니라 IP 남용을 봄) 별도 테이블로 둡니다.
@@ -146,6 +176,7 @@ alter table public.app_settings enable row level security;
 alter table public.admin_actions enable row level security;
 alter table public.rate_events enable row level security;
 alter table public.email_verifications enable row level security;
+alter table public.ip_reputation enable row level security;
 
 -- 오래된 기록을 언제 마지막으로 정리했는지 (자동 정리 주기 판단용)
 alter table public.app_settings add column if not exists last_pruned_at timestamptz;
@@ -182,7 +213,19 @@ language sql
 security definer
 set search_path = public
 as $$
-    select case
+    -- ① IP 평판에 의한 차단이 최우선. 아이디를 바꿔가며 시도하는 공격은
+    --    계정 단위 잠금으로는 막히지 않으므로 IP 단위 차단이 필요하다.
+    select coalesce((
+        select case
+            when manual_override = 'allow' then false
+            when manual_override = 'block' then true
+            else blocked_until is not null and blocked_until > now()
+        end
+        from public.ip_reputation where ip = p_ip
+    ), false)
+    or
+    -- ② 계정 단위 잠금 (기존 규칙)
+    case
         -- IP 를 알 수 없으면 아이디 기준으로만 판정 (임계값을 올려 오탐을 줄임)
         when coalesce(p_ip, '') = '' then
             (select count(*) from public.login_attempts
@@ -246,11 +289,218 @@ revoke all on function public.is_rate_limited(text, text, text, int, int, int)
     from public, anon, authenticated;
 
 
+-- 로그인 시도 1건을 기록하는 내부 헬퍼.
+-- 기록 지점이 여러 곳(일반 로그인 / 환경변수 관리자)이라 한 곳에 모아 둡니다.
+-- p_context 예: {"ua":"...", "country":"KR", "city":"Seoul", "lat":"37.5", "lon":"127.0"}
+create or replace function public.record_attempt_internal(
+    p_username text,
+    p_ip text,
+    p_success boolean,
+    p_context jsonb,
+    p_user_existed boolean
+)
+returns void
+language sql
+security definer
+set search_path = public
+as $$
+    insert into public.login_attempts
+        (username, ip, success, user_agent, country, city, lat, lon, user_existed)
+    values (
+        p_username,
+        p_ip,
+        p_success,
+        nullif(p_context->>'ua', ''),
+        nullif(p_context->>'country', ''),
+        nullif(p_context->>'city', ''),
+        nullif(p_context->>'lat', '')::numeric,
+        nullif(p_context->>'lon', '')::numeric,
+        p_user_existed
+    );
+$$;
+
+revoke all on function public.record_attempt_internal(text, text, boolean, jsonb, boolean)
+    from public, anon, authenticated;
+
+
+-- ============================================================
+-- 2-2. 침입 탐지 (IP 평판)
+-- ============================================================
+
+-- 최근 행동을 근거로 IP 위험 점수를 계산한다.
+-- 순수 조회 함수이므로 부작용이 없고, 규칙을 바꿀 때는 여기만 고치면 된다.
+--
+-- 반환: {score, reasons[]}
+create or replace function public.assess_ip(p_ip text)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+    v_score int := 0;
+    v_reasons text[] := '{}';
+    v_fails int;
+    v_distinct_users int;
+    v_total int;
+    v_success int;
+    v_ghost int;
+    v_bot int;
+    v_burst int;
+begin
+    if coalesce(p_ip, '') = '' then
+        return jsonb_build_object('score', 0, 'reasons', '[]'::jsonb);
+    end if;
+
+    -- 최근 30분 집계를 한 번에 계산
+    select
+        count(*) filter (where not success),
+        count(distinct username) filter (where not success),
+        count(*),
+        count(*) filter (where success),
+        count(*) filter (where not success and user_existed is false),
+        count(*) filter (where user_agent is null
+                            or user_agent ~* '(curl|wget|python-requests|go-http|libwww|scrapy|httpclient)'),
+        count(*) filter (where attempted_at > now() - interval '1 minute')
+      into v_fails, v_distinct_users, v_total, v_success, v_ghost, v_bot, v_burst
+      from public.login_attempts
+     where ip = p_ip
+       and attempted_at > now() - interval '30 minutes';
+
+    -- 한 계정 무차별 대입
+    if v_fails >= 10 then
+        v_score := v_score + 40;
+        v_reasons := v_reasons || format('30분 내 로그인 실패 %s회', v_fails);
+    elsif v_fails >= 5 then
+        v_score := v_score + 20;
+        v_reasons := v_reasons || format('30분 내 로그인 실패 %s회', v_fails);
+    end if;
+
+    -- 아이디 스프레이 (가장 흔한 봇 패턴)
+    if v_distinct_users >= 8 then
+        v_score := v_score + 50;
+        v_reasons := v_reasons || format('서로 다른 아이디 %s개 시도(스프레이)', v_distinct_users);
+    elsif v_distinct_users >= 4 then
+        v_score := v_score + 25;
+        v_reasons := v_reasons || format('서로 다른 아이디 %s개 시도', v_distinct_users);
+    end if;
+
+    -- 크리덴셜 스터핑: 시도는 많은데 성공률이 극히 낮음
+    if v_total >= 30 and v_success::numeric / greatest(v_total, 1) < 0.05 then
+        v_score := v_score + 30;
+        v_reasons := v_reasons || format('시도 %s회 중 성공 %s회(스터핑 의심)', v_total, v_success);
+    end if;
+
+    -- 정찰: 존재하지 않는 계정만 훑음
+    if v_ghost >= 5 and v_ghost::numeric / greatest(v_fails, 1) > 0.8 then
+        v_score := v_score + 35;
+        v_reasons := v_reasons || format('없는 계정 위주로 %s회 시도(정찰)', v_ghost);
+    end if;
+
+    -- 자동화 도구 흔적
+    -- 타입을 명시하지 않으면 PostgreSQL 이 배열||배열로 해석해
+    -- "malformed array literal" 오류가 납니다. ::text 를 반드시 붙일 것.
+    if v_bot >= 3 then
+        v_score := v_score + 25;
+        v_reasons := v_reasons || '자동화 도구 User-Agent'::text;
+    end if;
+
+    -- 비인간 속도
+    if v_burst >= 10 then
+        v_score := v_score + 30;
+        v_reasons := v_reasons || format('1분 내 %s회 요청', v_burst);
+    end if;
+
+    return jsonb_build_object(
+        'score', least(v_score, 100),
+        'reasons', to_jsonb(v_reasons)
+    );
+end;
+$$;
+
+revoke all on function public.assess_ip(text) from public, anon, authenticated;
+
+
+-- 평가 결과를 ip_reputation 에 반영하고, 임계값을 넘으면 차단 시각을 찍는다.
+-- 점수가 높을수록 차단 시간이 길어진다.
+create or replace function public.update_ip_reputation(p_ip text)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+    v_assess jsonb;
+    v_score int;
+    v_block_minutes int := 0;
+    v_existing record;
+begin
+    if coalesce(p_ip, '') = '' then
+        return jsonb_build_object('blocked', false, 'score', 0);
+    end if;
+
+    v_assess := public.assess_ip(p_ip);
+    v_score := (v_assess->>'score')::int;
+
+    select manual_override into v_existing from public.ip_reputation where ip = p_ip;
+
+    -- 관리자가 직접 허용한 IP 는 점수와 무관하게 차단하지 않는다.
+    -- 회사·학교처럼 여러 사람이 한 IP 를 쓰는 경우의 오탐 안전장치.
+    if v_existing.manual_override = 'allow' then
+        insert into public.ip_reputation (ip, score, last_seen)
+        values (p_ip, v_score, now())
+        on conflict (ip) do update
+            set score = excluded.score, last_seen = now(),
+                reasons = v_assess->'reasons';
+        return jsonb_build_object('blocked', false, 'score', v_score, 'override', 'allow');
+    end if;
+
+    if v_score >= 90 then
+        v_block_minutes := 360;   -- 6시간
+    elsif v_score >= 70 then
+        v_block_minutes := 60;
+    elsif v_score >= 50 then
+        v_block_minutes := 15;
+    end if;
+
+    insert into public.ip_reputation (ip, score, reasons, last_seen, blocked_until)
+    values (
+        p_ip, v_score, v_assess->'reasons', now(),
+        case when v_block_minutes > 0
+             then now() + (v_block_minutes || ' minutes')::interval end
+    )
+    on conflict (ip) do update
+        set score = excluded.score,
+            reasons = excluded.reasons,
+            last_seen = now(),
+            -- 이미 걸린 차단은 줄이지 않고 더 긴 쪽을 유지한다
+            blocked_until = greatest(
+                public.ip_reputation.blocked_until,
+                excluded.blocked_until
+            );
+
+    return jsonb_build_object(
+        'blocked', v_block_minutes > 0,
+        'score', v_score,
+        'block_minutes', v_block_minutes,
+        'reasons', v_assess->'reasons'
+    );
+end;
+$$;
+
+revoke all on function public.update_ip_reputation(text) from public, anon, authenticated;
+
+
 -- 이전 버전의 함수 시그니처 제거 (인자가 바뀌었으므로)
 drop function if exists public.signup_user(text, text);
 drop function if exists public.login_user(text, text);
 drop function if exists public.get_signup_enabled();
 drop function if exists public.set_signup_enabled(boolean);
+
+-- p_context 를 추가하면서 인자 수가 바뀌므로 이전 시그니처를 제거합니다.
+-- 새 함수는 p_context 에 기본값이 있어 구버전의 4인자 호출도 그대로 동작합니다.
+drop function if exists public.login_user(text, text, text, text);
+drop function if exists public.record_login_attempt(text, text, text, boolean);
 
 
 -- ============================================================
@@ -340,7 +590,8 @@ create or replace function public.login_user(
     p_secret text,
     p_username text,
     p_password text,
-    p_ip text default null
+    p_ip text default null,
+    p_context jsonb default '{}'::jsonb
 )
 returns jsonb
 language plpgsql
@@ -350,14 +601,17 @@ as $$
 declare
     v_user record;
     v_ok boolean := false;
+    v_existed boolean;
 begin
     if not public.check_secret(p_secret) then
         return jsonb_build_object('success', false, 'reason', 'secret');
     end if;
 
     if public.is_login_locked(p_username, p_ip) then
-        insert into public.login_attempts (username, ip, success)
-        values (p_username, p_ip, false);
+        perform public.record_attempt_internal(
+            p_username, p_ip, false, p_context,
+            exists (select 1 from public.users where username = p_username)
+        );
         return jsonb_build_object('success', false, 'reason', 'locked');
     end if;
 
@@ -366,13 +620,22 @@ begin
       from public.users
      where username = p_username;
 
-    if v_user.id is not null
+    v_existed := v_user.id is not null;
+
+    if v_existed
        and v_user.password_hash = extensions.crypt(p_password, v_user.password_hash) then
         v_ok := true;
     end if;
 
-    insert into public.login_attempts (username, ip, success)
-    values (p_username, p_ip, v_ok);
+    perform public.record_attempt_internal(
+        p_username, p_ip, v_ok, p_context, v_existed
+    );
+
+    -- 실패했을 때만 평판을 다시 계산한다. 성공은 위험 신호가 아니고,
+    -- 매번 계산하면 정상 로그인에도 집계 쿼리가 붙는다.
+    if not v_ok then
+        perform public.update_ip_reputation(p_ip);
+    end if;
 
     if not v_ok then
         return jsonb_build_object('success', false, 'reason', 'credentials');
@@ -425,7 +688,8 @@ create or replace function public.record_login_attempt(
     p_secret text,
     p_username text,
     p_ip text,
-    p_success boolean
+    p_success boolean,
+    p_context jsonb default '{}'::jsonb
 )
 returns jsonb
 language plpgsql
@@ -437,8 +701,16 @@ begin
         return jsonb_build_object('success', false);
     end if;
 
-    insert into public.login_attempts (username, ip, success)
-    values (p_username, p_ip, p_success);
+    -- 환경변수 관리자는 DB 계정이 아니므로 user_existed 는 null(해당 없음)입니다.
+    -- false 로 두면 "없는 계정을 시도했다"는 뜻이 되어, 존재하지 않는 아이디만
+    -- 훑는 정찰 공격 탐지 통계를 정상 관리자 로그인이 오염시킵니다.
+    perform public.record_attempt_internal(
+        p_username, p_ip, p_success, p_context, null
+    );
+
+    if not p_success then
+        perform public.update_ip_reputation(p_ip);
+    end if;
 
     return jsonb_build_object('success', true);
 end;
@@ -980,13 +1252,130 @@ begin
 
     select coalesce(jsonb_agg(t order by t.attempted_at desc), '[]'::jsonb) into v_rows
       from (
-        select id, username, ip, success, attempted_at
+        select id, username, ip, success, attempted_at,
+               user_agent, country, city, user_existed
           from public.login_attempts
          order by attempted_at desc
          limit p_limit offset p_offset
       ) t;
 
     return jsonb_build_object('total', v_total, 'attempts', v_rows);
+end;
+$$;
+
+
+-- ── 침입 탐지: 관리자 조회·조작 ──────────────────────────
+create or replace function public.list_ip_reputation(
+    p_secret text,
+    p_limit int default 50,
+    p_offset int default 0,
+    p_only_flagged boolean default true
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+    v_rows jsonb;
+    v_total int;
+    v_blocked int;
+begin
+    if not public.check_secret(p_secret) then
+        return jsonb_build_object('total', 0, 'items', '[]'::jsonb);
+    end if;
+
+    select count(*) into v_total
+      from public.ip_reputation
+     where not p_only_flagged or score > 0 or manual_override is not null;
+
+    select count(*) into v_blocked
+      from public.ip_reputation
+     where (blocked_until is not null and blocked_until > now())
+        or manual_override = 'block';
+
+    select coalesce(jsonb_agg(t order by t.sort_key desc, t.score desc), '[]'::jsonb)
+      into v_rows
+      from (
+        select ip, score, blocked_until, manual_override, reasons,
+               first_seen, last_seen,
+               (blocked_until is not null and blocked_until > now()) as is_blocked,
+               extract(epoch from last_seen) as sort_key
+          from public.ip_reputation
+         where not p_only_flagged or score > 0 or manual_override is not null
+         order by last_seen desc
+         limit p_limit offset p_offset
+      ) t;
+
+    return jsonb_build_object('total', v_total, 'blocked', v_blocked, 'items', v_rows);
+end;
+$$;
+
+
+-- 관리자 수동 판단. 'allow' 는 오탐 구제(회사·학교 공용 IP 등),
+-- 'block' 은 영구 차단, null 은 자동 판정으로 되돌림.
+create or replace function public.set_ip_override(
+    p_secret text,
+    p_ip text,
+    p_override text          -- 'allow' | 'block' | null
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+    if not public.check_secret(p_secret) then
+        return jsonb_build_object('success', false);
+    end if;
+
+    if p_override is not null and p_override not in ('allow', 'block') then
+        return jsonb_build_object('success', false, 'error', 'invalid override');
+    end if;
+
+    insert into public.ip_reputation (ip, manual_override, blocked_until, last_seen)
+    values (
+        p_ip, p_override,
+        case when p_override = 'block' then now() + interval '100 years' end,
+        now()
+    )
+    on conflict (ip) do update
+        set manual_override = p_override,
+            -- allow 로 구제하면 걸려 있던 자동 차단도 함께 푼다
+            blocked_until = case
+                when p_override = 'allow' then null
+                when p_override = 'block' then now() + interval '100 years'
+                else public.ip_reputation.blocked_until
+            end,
+            last_seen = now();
+
+    return jsonb_build_object('success', true);
+end;
+$$;
+
+
+-- 자동 차단 즉시 해제 (점수는 남기되 차단만 품)
+create or replace function public.unblock_ip(p_secret text, p_ip text)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+    if not public.check_secret(p_secret) then
+        return jsonb_build_object('success', false);
+    end if;
+
+    update public.ip_reputation
+       set blocked_until = null, score = 0, reasons = '[]'::jsonb
+     where ip = p_ip;
+
+    -- 계정 단위 잠금 판정에 쓰이는 실패 기록도 함께 지워야 즉시 풀린다
+    delete from public.login_attempts
+     where ip = p_ip and not success
+       and attempted_at > now() - interval '30 minutes';
+
+    return jsonb_build_object('success', true);
 end;
 $$;
 
@@ -1119,6 +1508,12 @@ begin
     delete from public.rate_events
      where created_at < now() - interval '1 day';
 
+    -- 오래 조용한 IP 는 평판을 지웁니다. 관리자가 직접 지정한 항목은 남깁니다.
+    delete from public.ip_reputation
+     where manual_override is null
+       and last_seen < now() - interval '30 days'
+       and (blocked_until is null or blocked_until < now());
+
     -- 감사 로그는 더 오래 (1년) 보관합니다.
     delete from public.admin_actions
      where created_at < now() - interval '365 days';
@@ -1184,9 +1579,9 @@ grant execute on function public.signup_user(text, text, text, text) to anon, au
 grant execute on function public.create_password_reset(text, text, text) to anon, authenticated;
 grant execute on function public.create_email_verification(text, bigint) to anon, authenticated;
 grant execute on function public.verify_email_with_token(text, text) to anon, authenticated;
-grant execute on function public.login_user(text, text, text, text) to anon, authenticated;
+grant execute on function public.login_user(text, text, text, text, jsonb) to anon, authenticated;
 grant execute on function public.check_login_lock(text, text, text) to anon, authenticated;
-grant execute on function public.record_login_attempt(text, text, text, boolean) to anon, authenticated;
+grant execute on function public.record_login_attempt(text, text, text, boolean, jsonb) to anon, authenticated;
 grant execute on function public.get_user_session_state(text, bigint) to anon, authenticated;
 grant execute on function public.force_logout_user(text, bigint) to anon, authenticated;
 grant execute on function public.change_password(text, bigint, text, text) to anon, authenticated;
@@ -1202,6 +1597,9 @@ grant execute on function public.set_user_admin(text, bigint, boolean) to anon, 
 grant execute on function public.admin_delete_user(text, bigint) to anon, authenticated;
 grant execute on function public.get_login_attempts(text, int, int) to anon, authenticated;
 grant execute on function public.clear_login_attempts(text, text) to anon, authenticated;
+grant execute on function public.list_ip_reputation(text, int, int, boolean) to anon, authenticated;
+grant execute on function public.set_ip_override(text, text, text) to anon, authenticated;
+grant execute on function public.unblock_ip(text, text) to anon, authenticated;
 grant execute on function public.get_signup_stats(text, int) to anon, authenticated;
 grant execute on function public.log_admin_action(text, text, text, bigint, text, text, text) to anon, authenticated;
 grant execute on function public.get_admin_actions(text, int, int) to anon, authenticated;
