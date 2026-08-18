@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}본인 확인{% endblock %}
+{% block content %}
+    <h1>본인 확인</h1>
+
+    <p class="hint-block">
+        평소와 다른 환경에서 로그인하셨습니다.
+        본인이 맞다면 <strong>6자리 확인 코드</strong>를 입력해 주세요.
+        코드는 10분간 유효합니다.
+        <br><br>
+        확인이 끝나면 이 환경을 기억해 두므로 다음부터는 묻지 않습니다.
+    </p>
+
+    <form method="post" action="{{ url_for('verify_login') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+        <label for="code">확인 코드</label>
+        <input type="text" id="code" name="code" required autofocus
+               inputmode="numeric" pattern="[0-9]{6}" maxlength="6"
+               autocomplete="one-time-code">
+
+        <button type="submit">확인</button>
+    </form>
+
+    <p class="switch"><a href="{{ url_for('logout') }}">취소하고 로그인 화면으로</a></p>
+{% endblock %}

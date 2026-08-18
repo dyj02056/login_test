@@ -354,6 +354,30 @@ def login():
             },
         )
 
+        # 본인 확인이 필요한 로그인. 코드를 확인하기 전까지 로그인하지 않는다.
+        if result.get("reason") == "challenge":
+            sent = send_email(
+                result.get("email"),
+                "로그인 확인 코드",
+                f"평소와 다른 환경에서 로그인 시도가 있었습니다. "
+                f"본인이 맞다면 아래 코드를 입력해 주세요 (10분간 유효).<br><br>"
+                f"<strong style='font-size:22px'>{result.get('code')}</strong>",
+                "",
+            )
+            session.clear()
+            session["pending_challenge"] = result["challenge_id"]
+            session["pending_username"] = result.get("username")
+            session["pending_remember"] = remember
+            if sent:
+                flash("평소와 다른 환경입니다. 이메일로 보낸 확인 코드를 입력해 주세요.", "error")
+            else:
+                # 메일 발송이 꺼져 있으면 관리자가 코드를 전달해야 한다.
+                flash(
+                    "평소와 다른 환경입니다. 관리자에게 확인 코드를 요청해 주세요.",
+                    "error",
+                )
+            return redirect(url_for("verify_login"))
+
         if not result.get("success"):
             reason = result.get("reason")
             if reason == "locked":
@@ -392,6 +416,47 @@ def login():
         return redirect(url_for("dashboard"))
 
     return render_template("login.html", username="")
+
+
+@app.route("/verify-login", methods=["GET", "POST"])
+def verify_login():
+    challenge_id = session.get("pending_challenge")
+    if not challenge_id:
+        flash("먼저 로그인해 주세요.", "error")
+        return redirect(url_for("login"))
+
+    if request.method == "POST":
+        code = request.form.get("code", "").strip()
+        result = rpc(
+            "verify_login_challenge",
+            {"p_challenge_id": challenge_id, "p_code": code},
+        )
+
+        if not result.get("success"):
+            error = result.get("error", "확인에 실패했습니다.")
+            # 만료·횟수초과면 처음부터 다시 로그인해야 한다.
+            if "만료" in error or "초과" in error:
+                session.clear()
+                flash(error, "error")
+                return redirect(url_for("login"))
+            flash(error, "error")
+            return render_template("verify_login.html")
+
+        remember = session.get("pending_remember", False)
+        session.clear()
+        session["user_id"] = result["id"]
+        session["username"] = result["username"]
+        session["is_admin"] = bool(result.get("is_admin"))
+        session["sv"] = result.get("session_version")
+        session["sv_checked_at"] = time.time()
+        session.permanent = remember
+
+        flash("확인되었습니다. 이 환경은 다음부터 다시 묻지 않습니다.", "success")
+        if session["is_admin"]:
+            return redirect(url_for("admin_panel"))
+        return redirect(url_for("dashboard"))
+
+    return render_template("verify_login.html")
 
 
 @app.route("/logout")
@@ -472,10 +537,18 @@ def delete_account():
 # 비밀번호 재설정
 # ----------------------------------------------------------------------
 
-def send_email(to_email, subject, intro, link):
-    """Resend 로 메일 발송. 키가 없으면 조용히 False 를 돌려준다."""
+def send_email(to_email, subject, intro, link=""):
+    """Resend 로 메일 발송. 키가 없으면 조용히 False 를 돌려준다.
+
+    link 가 비어 있으면 본문만 보낸다(확인 코드처럼 링크가 없는 경우).
+    """
     if not RESEND_API_KEY or not to_email:
         return False
+
+    html = f"<p>{intro}</p>"
+    if link:
+        html += f'<p><a href="{link}">{link}</a></p>'
+
     try:
         response = requests.post(
             "https://api.resend.com/emails",
@@ -487,7 +560,7 @@ def send_email(to_email, subject, intro, link):
                 "from": RESEND_FROM,
                 "to": [to_email],
                 "subject": subject,
-                "html": f'<p>{intro}</p><p><a href="{link}">{link}</a></p>',
+                "html": html,
             },
             timeout=10,
         )
@@ -810,6 +883,8 @@ def admin_threats():
         risk_events=risk.get("events", []),
         risk_total=risk.get("total", 0),
         risk_threshold=risk.get("threshold", 101),
+        challenge_threshold=risk.get("challenge_threshold", 101),
+        pending_challenges=rpc("list_pending_challenges"),
     )
 
 
@@ -821,14 +896,24 @@ def admin_risk_threshold():
         flash("임계값을 입력해 주세요.", "error")
         return safe_redirect("admin_threats")
 
-    result = rpc("set_risk_threshold", {"p_threshold": value})
+    kind = request.form.get("kind", "block")
+    fn = "set_risk_threshold" if kind == "block" else "set_challenge_threshold"
+    result = rpc(fn, {"p_threshold": value})
+
     if result.get("success"):
-        log_admin("risk_threshold", detail=str(value))
-        flash(
-            "위험 점수 차단을 껐습니다(기록만 함)." if value > 100
-            else f"위험 점수 {value}점 이상 로그인을 차단합니다.",
-            "success",
-        )
+        log_admin(f"risk_threshold_{kind}", detail=str(value))
+        if kind == "block":
+            flash(
+                "위험 점수 차단을 껐습니다(기록만 함)." if value > 100
+                else f"위험 점수 {value}점 이상 로그인을 차단합니다.",
+                "success",
+            )
+        else:
+            flash(
+                "본인 확인 요구를 껐습니다." if value > 100
+                else f"위험 점수 {value}점 이상이면 이메일 코드로 본인 확인을 요구합니다.",
+                "success",
+            )
     else:
         flash(result.get("error", "설정에 실패했습니다."), "error")
     return safe_redirect("admin_threats")

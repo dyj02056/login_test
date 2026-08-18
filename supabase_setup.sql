@@ -128,6 +128,25 @@ create index if not exists login_risk_events_score_idx
     on public.login_risk_events (score desc, created_at desc);
 
 
+-- 위험한 로그인을 붙잡아 두는 일회용 코드.
+-- 코드가 확인되기 전까지 로그인은 완료되지 않습니다.
+create table if not exists public.login_challenges (
+    id bigint generated always as identity primary key,
+    user_id bigint not null references public.users(id) on delete cascade,
+    code_hash text not null,
+    ip text,
+    context jsonb not null default '{}'::jsonb,
+    risk_score int not null default 0,
+    attempts int not null default 0,
+    expires_at timestamptz not null,
+    used_at timestamptz,
+    created_at timestamptz not null default now()
+);
+
+create index if not exists login_challenges_user_idx
+    on public.login_challenges (user_id, created_at desc);
+
+
 -- 가입·재설정 남용을 막기 위한 사건 기록.
 -- 로그인 잠금과 성격이 달라(계정이 아니라 IP 남용을 봄) 별도 테이블로 둡니다.
 create table if not exists public.rate_events (
@@ -216,12 +235,19 @@ alter table public.email_verifications enable row level security;
 alter table public.ip_reputation enable row level security;
 alter table public.user_login_profile enable row level security;
 alter table public.login_risk_events enable row level security;
+alter table public.login_challenges enable row level security;
 
 -- 위험 점수가 이 값 이상이면 로그인을 차단합니다.
 -- 기본 101 = 아무것도 차단하지 않음(섀도 모드). 실제 데이터로 오탐이 없음을
 -- 확인한 뒤 관리자 화면에서 86 등으로 낮추는 것을 전제로 합니다.
 alter table public.app_settings
     add column if not exists risk_block_threshold int not null default 101;
+
+-- 이 점수 이상이면 이메일 코드로 본인 확인을 요구합니다.
+-- 기본 101 = 사용 안 함. 코드를 자동 발송하려면 RESEND_API_KEY 가 필요하므로,
+-- 메일 발송을 켜기 전에 이 값을 낮추면 관리자가 코드를 수동 전달해야 합니다.
+alter table public.app_settings
+    add column if not exists risk_challenge_threshold int not null default 101;
 
 -- 오래된 기록을 언제 마지막으로 정리했는지 (자동 정리 주기 판단용)
 alter table public.app_settings add column if not exists last_pruned_at timestamptz;
@@ -556,6 +582,61 @@ as $$
 $$;
 
 
+-- 이 로그인을 "평소 모습"으로 프로필에 반영한다.
+-- 정상 판정을 받았거나, 본인이 이메일 코드로 확인한 로그인에만 호출해야 한다.
+create or replace function public.learn_login_profile(
+    p_user_id bigint,
+    p_ip text,
+    p_context jsonb
+)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+    v_country text := nullif(p_context->>'country', '');
+    v_ua_hash text := md5(coalesce(p_context->>'ua', ''));
+    v_lat numeric := nullif(p_context->>'lat', '')::numeric;
+    v_lon numeric := nullif(p_context->>'lon', '')::numeric;
+    v_hour int := extract(hour from now())::int;
+begin
+    update public.user_login_profile
+       set known_ips = case when known_ips ? p_ip then known_ips
+                            else (
+                                -- 최근 10개만 유지
+                                select jsonb_agg(v) from (
+                                    select v from jsonb_array_elements(
+                                        jsonb_build_array(p_ip) || known_ips
+                                    ) v limit 10
+                                ) t
+                            ) end,
+           known_countries = case
+                when v_country is null or known_countries ? v_country then known_countries
+                else known_countries || jsonb_build_array(v_country) end,
+           known_agents = case when known_agents ? v_ua_hash then known_agents
+                               else (
+                                   select jsonb_agg(v) from (
+                                       select v from jsonb_array_elements(
+                                           jsonb_build_array(v_ua_hash) || known_agents
+                                       ) v limit 5
+                                   ) t
+                               ) end,
+           typical_hours = case when v_hour = any(typical_hours) then typical_hours
+                                else typical_hours || v_hour end,
+           last_lat = coalesce(v_lat, last_lat),
+           last_lon = coalesce(v_lon, last_lon),
+           last_login_at = now(),
+           login_count = login_count + 1,
+           updated_at = now()
+     where user_id = p_user_id;
+end;
+$$;
+
+revoke all on function public.learn_login_profile(bigint, text, jsonb)
+    from public, anon, authenticated;
+
+
 -- 비밀번호가 맞은 로그인이 "정말 본인인지" 평가한다.
 -- 평소 패턴에서 벗어난 정도를 점수로 매기고, 프로필을 갱신한다.
 create or replace function public.assess_login_risk(
@@ -584,6 +665,8 @@ declare
     v_other_fails int;
     v_own_fails int;
     v_threshold int;
+    v_challenge_threshold int;
+    v_can_challenge boolean := false;
     v_action text;
 begin
     v_country := nullif(p_context->>'country', '');
@@ -686,9 +769,18 @@ begin
 
     v_score := least(v_score, 100);
 
-    select risk_block_threshold into v_threshold from public.app_settings where id = true;
+    select risk_block_threshold, risk_challenge_threshold
+      into v_threshold, v_challenge_threshold
+      from public.app_settings where id = true;
+
+    -- 이메일이 없으면 코드를 보낼 곳이 없으므로 본인 확인을 요구할 수 없다.
+    select coalesce(email, '') <> '' into v_can_challenge
+      from public.users where id = p_user_id;
+
     if v_score >= coalesce(v_threshold, 101) then
         v_action := 'blocked';
+    elsif v_score >= coalesce(v_challenge_threshold, 101) and v_can_challenge then
+        v_action := 'challenge';
     elsif v_score >= 61 then
         v_action := 'flagged';
     else
@@ -698,38 +790,9 @@ begin
     -- 정상으로 판정된 로그인만 학습한다.
     -- 의심스러운 로그인(flagged)까지 학습하면, 공격자가 한 번 통과하는 순간
     -- 그 위치·기기가 "평소 패턴"이 되어 이후 탐지가 무력화된다.
-    -- 대가로 실제 해외 출장자는 매번 주의로 표시되는데, 이는 본인 확인 수단
-    -- (이메일 코드)이 붙는 다음 단계에서 "본인 맞음"을 눌러 해소할 부분이다.
+    -- 본인이 이메일 코드로 확인한 경우에는 verify_login_challenge 에서 학습한다.
     if v_action = 'allowed' then
-        update public.user_login_profile
-           set known_ips = case when known_ips ? p_ip then known_ips
-                                else (
-                                    -- 최근 10개만 유지
-                                    select jsonb_agg(v) from (
-                                        select v from jsonb_array_elements(
-                                            jsonb_build_array(p_ip) || known_ips
-                                        ) v limit 10
-                                    ) t
-                                ) end,
-               known_countries = case
-                    when v_country is null or known_countries ? v_country then known_countries
-                    else known_countries || jsonb_build_array(v_country) end,
-               known_agents = case when known_agents ? v_ua_hash then known_agents
-                                   else (
-                                       select jsonb_agg(v) from (
-                                           select v from jsonb_array_elements(
-                                               jsonb_build_array(v_ua_hash) || known_agents
-                                           ) v limit 5
-                                       ) t
-                                   ) end,
-               typical_hours = case when v_hour = any(typical_hours) then typical_hours
-                                    else typical_hours || v_hour end,
-               last_lat = coalesce(v_lat, last_lat),
-               last_lon = coalesce(v_lon, last_lon),
-               last_login_at = now(),
-               login_count = login_count + 1,
-               updated_at = now()
-         where user_id = p_user_id;
+        perform public.learn_login_profile(p_user_id, p_ip, p_context);
     end if;
 
     if v_score > 0 then
@@ -751,6 +814,156 @@ $$;
 
 revoke all on function public.assess_login_risk(bigint, text, text, jsonb)
     from public, anon, authenticated;
+
+
+-- 본인 확인 코드 발급. 6자리 숫자이며 원문은 반환값으로 한 번만 나가고
+-- DB 에는 해시만 남는다(비밀번호 재설정 토큰과 같은 방식).
+create or replace function public.create_login_challenge(
+    p_user_id bigint,
+    p_ip text,
+    p_context jsonb,
+    p_risk_score int
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+    v_code text;
+    v_id bigint;
+    v_email text;
+begin
+    select email into v_email from public.users where id = p_user_id;
+    if coalesce(v_email, '') = '' then
+        return jsonb_build_object('issued', false);
+    end if;
+
+    -- 진행 중이던 이전 코드는 무효화한다 (한 번에 하나만 유효)
+    update public.login_challenges
+       set used_at = now()
+     where user_id = p_user_id and used_at is null;
+
+    v_code := lpad((floor(random() * 1000000))::int::text, 6, '0');
+
+    insert into public.login_challenges
+        (user_id, code_hash, ip, context, risk_score, expires_at)
+    values (
+        p_user_id,
+        encode(extensions.digest(v_code, 'sha256'), 'hex'),
+        p_ip, coalesce(p_context, '{}'::jsonb), p_risk_score,
+        now() + interval '10 minutes'
+    )
+    returning id into v_id;
+
+    return jsonb_build_object(
+        'issued', true, 'challenge_id', v_id, 'code', v_code, 'email', v_email
+    );
+end;
+$$;
+
+revoke all on function public.create_login_challenge(bigint, text, jsonb, int)
+    from public, anon, authenticated;
+
+
+-- 코드 확인. 성공하면 그 로그인을 정상 패턴으로 학습해,
+-- 실제 출장자가 매번 확인을 반복하지 않도록 한다.
+create or replace function public.verify_login_challenge(
+    p_secret text,
+    p_challenge_id bigint,
+    p_code text
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+    v_ch record;
+    v_user record;
+begin
+    if not public.check_secret(p_secret) then
+        return jsonb_build_object('success', false, 'error', '서버 인증에 실패했습니다.');
+    end if;
+
+    select * into v_ch from public.login_challenges where id = p_challenge_id;
+
+    if v_ch.id is null or v_ch.used_at is not null or v_ch.expires_at <= now() then
+        return jsonb_build_object('success', false,
+            'error', '확인 코드가 만료되었습니다. 다시 로그인해 주세요.');
+    end if;
+
+    -- 코드 자체를 대입으로 뚫지 못하게 시도 횟수를 제한한다.
+    if v_ch.attempts >= 5 then
+        update public.login_challenges set used_at = now() where id = p_challenge_id;
+        return jsonb_build_object('success', false,
+            'error', '입력 횟수를 초과했습니다. 다시 로그인해 주세요.');
+    end if;
+
+    if v_ch.code_hash <> encode(extensions.digest(p_code, 'sha256'), 'hex') then
+        update public.login_challenges
+           set attempts = attempts + 1 where id = p_challenge_id;
+        return jsonb_build_object('success', false,
+            'error', '코드가 올바르지 않습니다.',
+            'remaining', 4 - v_ch.attempts);
+    end if;
+
+    update public.login_challenges set used_at = now() where id = p_challenge_id;
+
+    select id, username, is_admin, is_active, session_version into v_user
+      from public.users where id = v_ch.user_id;
+
+    if v_user.id is null or not v_user.is_active then
+        return jsonb_build_object('success', false, 'error', '사용할 수 없는 계정입니다.');
+    end if;
+
+    -- 본인이 확인했으므로 이 환경을 평소 패턴으로 학습한다.
+    perform public.learn_login_profile(v_user.id, v_ch.ip, v_ch.context);
+
+    update public.login_risk_events
+       set action = 'confirmed'
+     where username = v_user.username
+       and created_at > now() - interval '15 minutes'
+       and action = 'challenge';
+
+    return jsonb_build_object(
+        'success', true,
+        'id', v_user.id,
+        'username', v_user.username,
+        'is_admin', v_user.is_admin,
+        'session_version', v_user.session_version
+    );
+end;
+$$;
+
+
+-- 관리자용: 메일 발송이 꺼져 있을 때 코드를 대신 전달하기 위한 목록.
+-- 코드 자체는 해시로만 저장되어 있어 볼 수 없고, 진행 여부만 확인한다.
+create or replace function public.list_pending_challenges(p_secret text)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+    v_rows jsonb;
+begin
+    if not public.check_secret(p_secret) then
+        return '[]'::jsonb;
+    end if;
+
+    select coalesce(jsonb_agg(t order by t.created_at desc), '[]'::jsonb) into v_rows
+      from (
+        select c.id, u.username, c.ip, c.risk_score, c.attempts,
+               c.created_at, c.expires_at
+          from public.login_challenges c
+          join public.users u on u.id = c.user_id
+         where c.used_at is null and c.expires_at > now()
+      ) t;
+
+    return v_rows;
+end;
+$$;
 
 
 -- 이전 버전의 함수 시그니처 제거 (인자가 바뀌었으므로)
@@ -865,6 +1078,7 @@ declare
     v_ok boolean := false;
     v_existed boolean;
     v_risk jsonb;
+    v_challenge jsonb;
 begin
     if not public.check_secret(p_secret) then
         return jsonb_build_object('success', false, 'reason', 'secret');
@@ -920,6 +1134,26 @@ begin
             'risk_score', (v_risk->>'score')::int,
             'risk_reasons', v_risk->'reasons'
         );
+    end if;
+
+    -- 본인 확인이 필요한 구간. 코드를 확인하기 전까지 로그인은 완료되지 않는다.
+    if v_risk->>'action' = 'challenge' then
+        v_challenge := public.create_login_challenge(
+            v_user.id, p_ip, p_context, (v_risk->>'score')::int
+        );
+        if (v_challenge->>'issued')::boolean then
+            return jsonb_build_object(
+                'success', false,
+                'reason', 'challenge',
+                'challenge_id', (v_challenge->>'challenge_id')::bigint,
+                'code', v_challenge->>'code',
+                'email', v_challenge->>'email',
+                'username', v_user.username,
+                'risk_score', (v_risk->>'score')::int,
+                'risk_reasons', v_risk->'reasons'
+            );
+        end if;
+        -- 코드를 보낼 수 없으면 통과시키되 위험으로 기록해 둔다.
     end if;
 
     return jsonb_build_object(
@@ -1669,7 +1903,9 @@ begin
     return jsonb_build_object(
         'total', v_total,
         'events', v_rows,
-        'threshold', (select risk_block_threshold from public.app_settings where id = true)
+        'threshold', (select risk_block_threshold from public.app_settings where id = true),
+        'challenge_threshold',
+            (select risk_challenge_threshold from public.app_settings where id = true)
     );
 end;
 $$;
@@ -1690,6 +1926,25 @@ begin
         return jsonb_build_object('success', false, 'error', '1~101 사이여야 합니다.');
     end if;
     update public.app_settings set risk_block_threshold = p_threshold where id = true;
+    return jsonb_build_object('success', true, 'threshold', p_threshold);
+end;
+$$;
+
+
+create or replace function public.set_challenge_threshold(p_secret text, p_threshold int)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+    if not public.check_secret(p_secret) then
+        return jsonb_build_object('success', false);
+    end if;
+    if p_threshold < 1 or p_threshold > 101 then
+        return jsonb_build_object('success', false, 'error', '1~101 사이여야 합니다.');
+    end if;
+    update public.app_settings set risk_challenge_threshold = p_threshold where id = true;
     return jsonb_build_object('success', true, 'threshold', p_threshold);
 end;
 $$;
@@ -1845,6 +2100,9 @@ begin
     delete from public.email_verifications
      where used_at is not null or expires_at < now() - interval '7 days';
 
+    delete from public.login_challenges
+     where used_at is not null or expires_at < now() - interval '1 day';
+
     -- 속도 제한 판정은 최근 60분만 보므로 하루치만 남겨도 충분합니다.
     delete from public.rate_events
      where created_at < now() - interval '1 day';
@@ -1947,6 +2205,9 @@ grant execute on function public.set_ip_override(text, text, text) to anon, auth
 grant execute on function public.unblock_ip(text, text) to anon, authenticated;
 grant execute on function public.list_risk_events(text, int, int, int) to anon, authenticated;
 grant execute on function public.set_risk_threshold(text, int) to anon, authenticated;
+grant execute on function public.verify_login_challenge(text, bigint, text) to anon, authenticated;
+grant execute on function public.list_pending_challenges(text) to anon, authenticated;
+grant execute on function public.set_challenge_threshold(text, int) to anon, authenticated;
 grant execute on function public.get_signup_stats(text, int) to anon, authenticated;
 grant execute on function public.log_admin_action(text, text, text, bigint, text, text, text) to anon, authenticated;
 grant execute on function public.get_admin_actions(text, int, int) to anon, authenticated;
